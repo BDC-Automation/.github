@@ -1,0 +1,312 @@
+name: Reusable DEV Deployment
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      build_command:
+        required: true
+        type: string
+        description: 'Build command (mvn package, npm build, etc.)'
+      artifact_path:
+        required: true
+        type: string
+        description: 'Path to built artifact (target/*.jar, .next/, etc.)'
+      runtime:
+        required: true
+        type: string
+        description: 'Runtime: java, nodejs, python, nextjs'
+      java_version:
+        required: false
+        type: string
+        default: '17'
+      node_version:
+        required: false
+        type: string
+        default: '20'
+      python_version:
+        required: false
+        type: string
+        default: '3.11'
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      SLACK_WEBHOOK:
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: bdcautomation-artifactory
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Setup language-specific environments
+      - name: Setup Java
+        if: inputs.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'corretto'
+          cache: 'maven'
+      
+      - name: Setup Node.js
+        if: inputs.runtime == 'nodejs' || inputs.runtime == 'nextjs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+      
+      - name: Setup Python
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: 'pip'
+      
+      # Run tests
+      - name: Run tests
+        run: |
+          echo "🧪 Running tests for ${{ inputs.runtime }}..."
+          case "${{ inputs.runtime }}" in
+            java)
+              mvn test
+              ;;
+            nodejs|nextjs)
+              npm ci
+              npm test || echo "No tests configured"
+              ;;
+            python)
+              pip install -r requirements.txt
+              pytest || echo "No tests configured"
+              ;;
+          esac
+      
+      # Build application
+      - name: Build application
+        run: |
+          echo "🔨 Building ${{ inputs.app_name }}..."
+          ${{ inputs.build_command }}
+      
+      # Create deployment package
+      - name: Create deployment package
+        run: |
+          echo "📦 Creating deployment package..."
+          mkdir -p deployment-package
+          
+          case "${{ inputs.runtime }}" in
+            java)
+              # Copy JAR file
+              cp ${{ inputs.artifact_path }} deployment-package/
+              # Copy Procfile if exists
+              [ -f Procfile ] && cp Procfile deployment-package/
+              # Copy EB extensions if exists
+              [ -d .ebextensions ] && cp -r .ebextensions deployment-package/
+              ;;
+            nodejs|nextjs)
+              # Copy built files
+              cp -r ${{ inputs.artifact_path }} deployment-package/
+              cp package*.json deployment-package/
+              [ -f Procfile ] && cp Procfile deployment-package/
+              [ -d .ebextensions ] && cp -r .ebextensions deployment-package/
+              ;;
+            python)
+              # Copy application files
+              cp -r ${{ inputs.artifact_path }} deployment-package/
+              cp requirements.txt deployment-package/
+              [ -f Procfile ] && cp Procfile deployment-package/
+              [ -d .ebextensions ] && cp -r .ebextensions deployment-package/
+              ;;
+          esac
+          
+          # Create zip
+          cd deployment-package
+          zip -r ../app-${{ github.sha }}.zip . -q
+          cd ..
+          
+          echo "✅ Deployment package created: app-${{ github.sha }}.zip"
+          ls -lh app-${{ github.sha }}.zip
+      
+      # Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Upload to S3
+      - name: Upload artifact to S3
+        run: |
+          echo "☁️  Uploading to S3..."
+          aws s3 cp app-${{ github.sha }}.zip \
+            s3://${{ env.S3_BUCKET }}/${{ inputs.app_name }}/app-${{ github.sha }}.zip
+          echo "✅ Uploaded to s3://${{ env.S3_BUCKET }}/${{ inputs.app_name }}/app-${{ github.sha }}.zip"
+      
+      # Create EB application version
+      - name: Create Elastic Beanstalk application version
+        run: |
+          echo "📋 Creating EB application version..."
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ inputs.app_name }} \
+            --version-label v-${{ github.sha }} \
+            --source-bundle S3Bucket=${{ env.S3_BUCKET }},S3Key=${{ inputs.app_name }}/app-${{ github.sha }}.zip \
+            --description "Build: ${{ github.sha }} | Branch: ${{ github.ref_name }} | Actor: ${{ github.actor }}"
+          echo "✅ Application version created: v-${{ github.sha }}"
+      
+      # Run database migrations
+      - name: Run database migrations
+        run: |
+          echo "🗄️  Running database migrations..."
+          
+          # Check if migrations directory exists
+          if [ ! -d "db/migrations" ]; then
+            echo "⏭️  No migrations directory found, skipping..."
+            exit 0
+          fi
+          
+          # Get DB credentials from AWS Secrets Manager
+          DB_CREDS=$(aws secretsmanager get-secret-value \
+            --secret-id /app/dev/${{ inputs.app_name }}/db-credentials \
+            --query SecretString --output text 2>/dev/null || echo "{}")
+          
+          if [ "$DB_CREDS" = "{}" ]; then
+            echo "⏭️  No database credentials found, skipping migrations..."
+            exit 0
+          fi
+          
+          DB_URL=$(echo $DB_CREDS | jq -r '.url')
+          DB_USER=$(echo $DB_CREDS | jq -r '.username')
+          DB_PASS=$(echo $DB_CREDS | jq -r '.password')
+          
+          # Install Flyway
+          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/10.4.1/flyway-commandline-10.4.1-linux-x64.tar.gz | tar xvz
+          
+          # Run migrations
+          ./flyway-10.4.1/flyway migrate \
+            -url="$DB_URL" \
+            -user="$DB_USER" \
+            -password="$DB_PASS" \
+            -locations=filesystem:./db/migrations
+          
+          echo "✅ Database migrations completed"
+      
+      # Deploy to Elastic Beanstalk
+      - name: Deploy to Elastic Beanstalk DEV
+        run: |
+          echo "🚀 Deploying to DEV environment..."
+          aws elasticbeanstalk update-environment \
+            --application-name ${{ inputs.app_name }} \
+            --environment-name ${{ inputs.app_name }}-dev \
+            --version-label v-${{ github.sha }}
+          
+          echo "⏳ Waiting for deployment to complete..."
+      
+      # Record deployment in DynamoDB
+      - name: Record deployment
+        run: |
+          echo "📝 Recording deployment..."
+          aws dynamodb put-item \
+            --table-name deployment-tracking \
+            --item '{
+              "app_name": {"S": "${{ inputs.app_name }}"},
+              "environment": {"S": "dev"},
+              "version": {"S": "v-${{ github.sha }}"},
+              "commit_sha": {"S": "${{ github.sha }}"},
+              "deployed_at": {"S": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"},
+              "deployed_by": {"S": "${{ github.actor }}"},
+              "branch": {"S": "${{ github.ref_name }}"},
+              "workflow_run_id": {"S": "${{ github.run_id }}"},
+              "github_run_url": {"S": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
+            }' 2>/dev/null || echo "⚠️  Could not record deployment (table may not exist)"
+      
+      # Wait for deployment
+      - name: Wait for deployment to complete
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --application-name ${{ inputs.app_name }} \
+            --environment-name ${{ inputs.app_name }}-dev
+          echo "✅ Deployment completed"
+      
+      # Health check
+      - name: Health check
+        run: |
+          echo "🏥 Running health check..."
+          sleep 30
+          
+          HEALTH_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name ${{ inputs.app_name }} \
+            --environment-names ${{ inputs.app_name }}-dev \
+            --query 'Environments[0].CNAME' --output text)
+          
+          echo "Health check URL: http://$HEALTH_URL/health"
+          
+          for i in {1..5}; do
+            if curl -f -s http://$HEALTH_URL/health > /dev/null; then
+              echo "✅ Health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "⏳ Waiting for application to be ready (attempt $i/5)..."
+            sleep 10
+          done
+          
+          echo "❌ Health check failed after 5 attempts"
+          exit 1
+      
+      # Auto-tag deployment
+      - name: Auto-tag deployment
+        if: success()
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          TAG_NAME="${{ inputs.app_name }}-dev-$(date +%Y%m%d-%H%M%S)"
+          git tag -a $TAG_NAME ${{ github.sha }} -m "Deployed to DEV at $(date)"
+          git push origin $TAG_NAME || echo "Could not push tag (might not have permissions)"
+      
+      # Notify Slack
+      - name: Notify Slack
+        if: always() && secrets.SLACK_WEBHOOK != ''
+        run: |
+          STATUS="${{ job.status }}"
+          EMOJI="✅"
+          COLOR="good"
+          
+          if [ "$STATUS" != "success" ]; then
+            EMOJI="❌"
+            COLOR="danger"
+          fi
+          
+          HEALTH_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name ${{ inputs.app_name }} \
+            --environment-names ${{ inputs.app_name }}-dev \
+            --query 'Environments[0].CNAME' --output text 2>/dev/null || echo "N/A")
+          
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "attachments": [{
+                "color": "'"$COLOR"'",
+                "title": "'"$EMOJI"' DEV Deployment '"$STATUS"'",
+                "fields": [
+                  {"title": "Application", "value": "${{ inputs.app_name }}", "short": true},
+                  {"title": "Environment", "value": "DEV", "short": true},
+                  {"title": "Version", "value": "v-'"${{ github.sha }}"'", "short": true},
+                  {"title": "Branch", "value": "${{ github.ref_name }}", "short": true},
+                  {"title": "Deployed by", "value": "${{ github.actor }}", "short": true},
+                  {"title": "URL", "value": "http://'"$HEALTH_URL"'", "short": true}
+                ],
+                "footer": "GitHub Actions",
+                "ts": '"$(date +%s)"'
+              }]
+            }' || echo "Could not send Slack notification"

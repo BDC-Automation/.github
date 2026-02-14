@@ -1,0 +1,274 @@
+name: Reusable UAT Scheduled Deployment
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      SLACK_WEBHOOK:
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: bdcautomation-artifactory
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version_to_deploy: ${{ steps.get_version.outputs.version }}
+      should_deploy: ${{ steps.get_version.outputs.should_deploy }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Determine version to deploy
+        id: get_version
+        run: |
+          echo "🔍 Determining which version to deploy to UAT..."
+          
+          # Get current day of week (1=Monday, 3=Wednesday, 5=Friday)
+          DAY_OF_WEEK=$(date +%u)
+          
+          # Determine cutoff date based on deployment day
+          case $DAY_OF_WEEK in
+            1)  # Monday - deploy what was merged by last Friday
+              CUTOFF_DATE=$(date -d "last friday 23:59:59" +%Y-%m-%d)
+              ;;
+            3)  # Wednesday - deploy what was merged by Monday
+              CUTOFF_DATE=$(date -d "last monday 23:59:59" +%Y-%m-%d)
+              ;;
+            5)  # Friday - deploy what was merged by Wednesday
+              CUTOFF_DATE=$(date -d "last wednesday 23:59:59" +%Y-%m-%d)
+              ;;
+            *)  # Not a deployment day
+              echo "⏭️  Today is not a deployment day (Mon/Wed/Fri only)"
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+              exit 0
+              ;;
+          esac
+          
+          echo "📅 Cutoff date: $CUTOFF_DATE 23:59:59"
+          
+          # Get the latest commit on release branch before cutoff
+          LATEST_COMMIT=$(git log --before="$CUTOFF_DATE 23:59:59" \
+            --first-parent origin/release/* --format="%H" -n 1 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_COMMIT" ]; then
+            echo "⚠️  No commits found before cutoff date"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          COMMIT_SHORT=$(echo $LATEST_COMMIT | cut -c1-7)
+          COMMIT_DATE=$(git log --format="%ci" -n 1 $LATEST_COMMIT)
+          COMMIT_AUTHOR=$(git log --format="%an" -n 1 $LATEST_COMMIT)
+          
+          echo "📦 Version to deploy:"
+          echo "   SHA: $LATEST_COMMIT"
+          echo "   Short: $COMMIT_SHORT"
+          echo "   Date: $COMMIT_DATE"
+          echo "   Author: $COMMIT_AUTHOR"
+          
+          echo "version=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+          echo "should_deploy=true" >> $GITHUB_OUTPUT
+
+  deploy-uat:
+    needs: determine-version
+    if: needs.determine-version.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: UAT
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Check if version exists in S3
+        run: |
+          VERSION="${{ needs.determine-version.outputs.version_to_deploy }}"
+          
+          echo "🔍 Checking if version exists..."
+          if ! aws s3 ls s3://${{ env.S3_BUCKET }}/${{ inputs.app_name }}/app-${VERSION}.zip 2>/dev/null; then
+            echo "❌ Error: Version $VERSION not found in S3"
+            echo "This version was not deployed to DEV yet"
+            exit 1
+          fi
+          
+          echo "✅ Version found in S3"
+      
+      - name: Check if EB application version exists
+        run: |
+          VERSION="${{ needs.determine-version.outputs.version_to_deploy }}"
+          
+          if ! aws elasticbeanstalk describe-application-versions \
+            --application-name ${{ inputs.app_name }} \
+            --version-labels v-${VERSION} \
+            --query 'ApplicationVersions[0].VersionLabel' \
+            --output text | grep -q "v-${VERSION}"; then
+            echo "❌ Error: Application version v-${VERSION} not found"
+            exit 1
+          fi
+          
+          echo "✅ Application version exists"
+      
+      - name: Checkout code for migrations
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.determine-version.outputs.version_to_deploy }}
+      
+      - name: Run database migrations (UAT)
+        run: |
+          echo "🗄️  Running database migrations for UAT..."
+          
+          # Check if migrations directory exists
+          if [ ! -d "db/migrations" ]; then
+            echo "⏭️  No migrations directory found, skipping..."
+            exit 0
+          fi
+          
+          # Get DB credentials
+          DB_CREDS=$(aws secretsmanager get-secret-value \
+            --secret-id /app/uat/${{ inputs.app_name }}/db-credentials \
+            --query SecretString --output text 2>/dev/null || echo "{}")
+          
+          if [ "$DB_CREDS" = "{}" ]; then
+            echo "⏭️  No database credentials found, skipping migrations..."
+            exit 0
+          fi
+          
+          DB_URL=$(echo $DB_CREDS | jq -r '.url')
+          DB_USER=$(echo $DB_CREDS | jq -r '.username')
+          DB_PASS=$(echo $DB_CREDS | jq -r '.password')
+          
+          # Install Flyway
+          wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/10.4.1/flyway-commandline-10.4.1-linux-x64.tar.gz | tar xvz
+          
+          # Run migrations
+          ./flyway-10.4.1/flyway migrate \
+            -url="$DB_URL" \
+            -user="$DB_USER" \
+            -password="$DB_PASS" \
+            -locations=filesystem:./db/migrations
+          
+          echo "✅ UAT database migrations completed"
+      
+      - name: Deploy to Elastic Beanstalk UAT
+        run: |
+          VERSION="${{ needs.determine-version.outputs.version_to_deploy }}"
+          
+          echo "🚀 Deploying version v-${VERSION} to UAT..."
+          aws elasticbeanstalk update-environment \
+            --application-name ${{ inputs.app_name }} \
+            --environment-name ${{ inputs.app_name }}-uat \
+            --version-label v-${VERSION}
+          
+          echo "⏳ Waiting for deployment..."
+      
+      - name: Record deployment
+        run: |
+          VERSION="${{ needs.determine-version.outputs.version_to_deploy }}"
+          
+          aws dynamodb put-item \
+            --table-name deployment-tracking \
+            --item '{
+              "app_name": {"S": "${{ inputs.app_name }}"},
+              "environment": {"S": "uat"},
+              "version": {"S": "v-'"${VERSION}"'"},
+              "commit_sha": {"S": "'"${VERSION}"'"},
+              "deployed_at": {"S": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"},
+              "deployed_by": {"S": "github-actions-scheduled"},
+              "branch": {"S": "release"},
+              "workflow_run_id": {"S": "${{ github.run_id }}"}
+            }' 2>/dev/null || echo "Could not record deployment"
+      
+      - name: Wait for deployment to complete
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --application-name ${{ inputs.app_name }} \
+            --environment-name ${{ inputs.app_name }}-uat
+          
+          echo "✅ Deployment completed"
+      
+      - name: Run smoke tests
+        run: |
+          echo "🧪 Running smoke tests..."
+          sleep 30
+          
+          HEALTH_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name ${{ inputs.app_name }} \
+            --environment-names ${{ inputs.app_name }}-uat \
+            --query 'Environments[0].CNAME' --output text)
+          
+          # Health check
+          for i in {1..5}; do
+            if curl -f -s http://$HEALTH_URL/health > /dev/null; then
+              echo "✅ Health check passed"
+              break
+            fi
+            if [ $i -eq 5 ]; then
+              echo "❌ Health check failed after 5 attempts"
+              exit 1
+            fi
+            sleep 10
+          done
+          
+          # Basic API test
+          if curl -f -s http://$HEALTH_URL/ > /dev/null; then
+            echo "✅ Root endpoint accessible"
+          fi
+          
+          echo "✅ Smoke tests passed"
+      
+      - name: Notify Slack
+        if: always() && secrets.SLACK_WEBHOOK != ''
+        run: |
+          STATUS="${{ job.status }}"
+          VERSION="${{ needs.determine-version.outputs.version_to_deploy }}"
+          VERSION_SHORT=$(echo $VERSION | cut -c1-7)
+          
+          EMOJI="🔔"
+          COLOR="warning"
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            COLOR="good"
+          elif [ "$STATUS" = "failure" ]; then
+            EMOJI="❌"
+            COLOR="danger"
+          fi
+          
+          HEALTH_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name ${{ inputs.app_name }} \
+            --environment-names ${{ inputs.app_name }}-uat \
+            --query 'Environments[0].CNAME' --output text 2>/dev/null || echo "N/A")
+          
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "'"$EMOJI"' UAT Scheduled Deployment '"$STATUS"'",
+              "attachments": [{
+                "color": "'"$COLOR"'",
+                "title": "UAT Deployment - ${{ inputs.app_name }}",
+                "fields": [
+                  {"title": "Status", "value": "'"$STATUS"'", "short": true},
+                  {"title": "Environment", "value": "UAT", "short": true},
+                  {"title": "Version", "value": "'"$VERSION_SHORT"'", "short": true},
+                  {"title": "URL", "value": "http://'"$HEALTH_URL"'", "short": true}
+                ],
+                "footer": "Testers can now begin testing!",
+                "ts": '"$(date +%s)"'
+              }]
+            }' || echo "Could not send Slack notification"

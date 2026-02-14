@@ -1,0 +1,178 @@
+name: Reusable Linear Validation
+
+on:
+  workflow_call:
+    inputs:
+      linear_team_keys:
+        required: false
+        type: string
+        default: '[A-Z]{2,10}'
+        description: 'Linear team keys (e.g., "ENG|BACKEND|API")'
+      require_in_progress:
+        required: false
+        type: boolean
+        default: true
+        description: 'Require issue to be in "In Progress" state'
+      allowed_states:
+        required: false
+        type: string
+        default: 'In Progress,In Review'
+        description: 'Comma-separated list of allowed states'
+    secrets:
+      LINEAR_API_KEY:
+        required: true
+
+jobs:
+  validate-linear-ids:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Validate Linear IDs in commits
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LINEAR_TEAM_KEYS: ${{ inputs.linear_team_keys }}
+          REQUIRE_IN_PROGRESS: ${{ inputs.require_in_progress }}
+          ALLOWED_STATES: ${{ inputs.allowed_states }}
+        run: |
+          echo "🔍 Validating Linear issue IDs in commits..."
+          echo ""
+          
+          # Get all commits in this PR
+          COMMITS=$(git log --format=%H origin/${{ github.base_ref }}..HEAD)
+          
+          # Linear ID pattern (e.g., ENG-123, BACKEND-456)
+          LINEAR_PATTERN="${LINEAR_TEAM_KEYS}-[0-9]+"
+          
+          INVALID_COMMITS=()
+          INVALID_STATES=()
+          NOT_FOUND=()
+          
+          # Convert allowed states to array
+          IFS=',' read -ra ALLOWED_STATES_ARRAY <<< "$ALLOWED_STATES"
+          
+          for commit in $COMMITS; do
+            MESSAGE=$(git log --format=%B -n 1 $commit)
+            COMMIT_SHORT=$(echo $commit | cut -c1-7)
+            COMMIT_TITLE=$(git log --format=%s -n 1 $commit)
+            
+            # Skip merge commits
+            if echo "$MESSAGE" | grep -qE "^Merge"; then
+              echo "⏭️  Skipping merge commit: $COMMIT_SHORT"
+              continue
+            fi
+            
+            # Extract Linear ID
+            LINEAR_ID=$(echo "$MESSAGE" | grep -oE "$LINEAR_PATTERN" | head -1)
+            
+            if [ -z "$LINEAR_ID" ]; then
+              INVALID_COMMITS+=("$COMMIT_SHORT: $COMMIT_TITLE")
+              continue
+            fi
+            
+            echo "📌 Found Linear ID: $LINEAR_ID in commit $COMMIT_SHORT"
+            
+            # Validate Linear ID exists and check state
+            GRAPHQL_QUERY=$(cat <<QUERY
+          {
+            "query": "query { issue(id: \"$LINEAR_ID\") { id identifier title state { name } } }"
+          }
+          QUERY
+          )
+            
+            RESPONSE=$(curl -s -X POST https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$GRAPHQL_QUERY")
+            
+            # Check if issue exists
+            if echo "$RESPONSE" | jq -e '.data.issue == null' > /dev/null 2>&1; then
+              echo "  ❌ Issue $LINEAR_ID not found in Linear"
+              NOT_FOUND+=("$COMMIT_SHORT: $LINEAR_ID not found")
+              continue
+            fi
+            
+            # Get issue state
+            ISSUE_STATE=$(echo "$RESPONSE" | jq -r '.data.issue.state.name')
+            ISSUE_TITLE=$(echo "$RESPONSE" | jq -r '.data.issue.title')
+            
+            echo "  📋 Issue: $LINEAR_ID - $ISSUE_TITLE"
+            echo "  📊 State: $ISSUE_STATE"
+            
+            # Check if state is allowed
+            if [ "$REQUIRE_IN_PROGRESS" = "true" ]; then
+              STATE_ALLOWED=false
+              for allowed_state in "${ALLOWED_STATES_ARRAY[@]}"; do
+                # Trim whitespace
+                allowed_state=$(echo "$allowed_state" | xargs)
+                if [ "$ISSUE_STATE" = "$allowed_state" ]; then
+                  STATE_ALLOWED=true
+                  break
+                fi
+              done
+              
+              if [ "$STATE_ALLOWED" = false ]; then
+                echo "  ❌ Issue $LINEAR_ID is in state '$ISSUE_STATE' (expected one of: ${ALLOWED_STATES})"
+                INVALID_STATES+=("$COMMIT_SHORT: $LINEAR_ID is '$ISSUE_STATE' (expected: ${ALLOWED_STATES})")
+              else
+                echo "  ✅ Issue $LINEAR_ID is in valid state"
+              fi
+            fi
+            
+            echo ""
+          done
+          
+          # Report results
+          EXIT_CODE=0
+          
+          if [ ${#INVALID_COMMITS[@]} -gt 0 ]; then
+            echo "❌ ERROR: The following commits are missing Linear IDs:"
+            echo ""
+            for invalid in "${INVALID_COMMITS[@]}"; do
+              echo "  - $invalid"
+            done
+            echo ""
+            echo "📝 Commit message format should include Linear ID (e.g., ${LINEAR_TEAM_KEYS}-123)"
+            echo "   Examples:"
+            echo "   - 'ENG-123: Add user authentication'"
+            echo "   - '[BACKEND-456] Fix login bug'"
+            echo ""
+            EXIT_CODE=1
+          fi
+          
+          if [ ${#NOT_FOUND[@]} -gt 0 ]; then
+            echo "❌ ERROR: The following Linear IDs were not found:"
+            echo ""
+            for nf in "${NOT_FOUND[@]}"; do
+              echo "  - $nf"
+            done
+            echo ""
+            echo "⚠️  Make sure the Linear issue exists before committing"
+            echo ""
+            EXIT_CODE=1
+          fi
+          
+          if [ ${#INVALID_STATES[@]} -gt 0 ]; then
+            echo "❌ ERROR: The following Linear issues are not in the correct state:"
+            echo ""
+            for inv_state in "${INVALID_STATES[@]}"; do
+              echo "  - $inv_state"
+            done
+            echo ""
+            echo "⚠️  Move the Linear issue to one of these states before merging:"
+            for allowed_state in "${ALLOWED_STATES_ARRAY[@]}"; do
+              echo "   - $(echo $allowed_state | xargs)"
+            done
+            echo ""
+            EXIT_CODE=1
+          fi
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ All commits have valid Linear IDs with correct states!"
+          fi
+          
+          exit $EXIT_CODE
