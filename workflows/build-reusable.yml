@@ -1,0 +1,206 @@
+name: Build Reusable
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'Platform type: java, python, or nodejs'
+        required: true
+        type: string
+      java-version:
+        description: 'Java version (if platform is java)'
+        required: false
+        type: string
+        default: '17'
+      python-version:
+        description: 'Python version (if platform is python)'
+        required: false
+        type: string
+        default: '3.11'
+      node-version:
+        description: 'Node.js version (if platform is nodejs)'
+        required: false
+        type: string
+        default: '20'
+      run-tests:
+        description: 'Whether to run tests'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+jobs:
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Java Build
+      - name: Set up JDK (Java)
+        if: inputs.platform == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'corretto'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+      
+      - name: Fix Maven wrapper permissions (Java)
+        if: inputs.platform == 'java'
+        run: |
+          if [ -f "./mvnw" ]; then
+            chmod +x ./mvnw
+            echo "✅ Maven wrapper permissions fixed"
+          else
+            echo "⚠️  No mvnw file found, skipping"
+          fi
+      
+      - name: Build with Maven (Java)
+        if: inputs.platform == 'java'
+        run: |
+          if [ -f "./mvnw" ]; then
+            ./mvnw clean package -DskipTests=${{ inputs.run-tests == false }}
+          else
+            mvn clean package -DskipTests=${{ inputs.run-tests == false }}
+          fi
+      
+      - name: Run tests (Java)
+        if: inputs.platform == 'java' && inputs.run-tests
+        run: |
+          if [ -f "./mvnw" ]; then
+            ./mvnw test
+          else
+            mvn test
+          fi
+      
+      # Python Build
+      - name: Set up Python
+        if: inputs.platform == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+      
+      - name: Install Python dependencies
+        if: inputs.platform == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+      
+      - name: Run Python tests
+        if: inputs.platform == 'python' && inputs.run-tests
+        run: |
+          if [ -f pytest.ini ] || [ -f setup.cfg ] || [ -d tests ]; then
+            pip install pytest pytest-cov
+            pytest --cov --cov-report=term-missing
+          else
+            echo "⚠️  No tests found, skipping"
+          fi
+      
+      - name: Build Python package
+        if: inputs.platform == 'python'
+        run: |
+          # Create deployment package
+          mkdir -p dist
+          if [ -f setup.py ]; then
+            python setup.py sdist bdist_wheel
+          else
+            # Create a simple deployment zip
+            zip -r dist/application.zip . -x "*.git*" "*.pyc" "__pycache__/*" "tests/*" "*.md"
+          fi
+      
+      # Node.js Build
+      - name: Set up Node.js
+        if: inputs.platform == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+      
+      - name: Install Node.js dependencies
+        if: inputs.platform == 'nodejs'
+        run: npm ci
+      
+      - name: Build Node.js application
+        if: inputs.platform == 'nodejs'
+        run: |
+          if grep -q "\"build\":" package.json; then
+            npm run build
+          else
+            echo "⚠️  No build script found in package.json, skipping"
+          fi
+      
+      - name: Run Node.js tests
+        if: inputs.platform == 'nodejs' && inputs.run-tests
+        run: |
+          if grep -q "\"test\":" package.json; then
+            npm test
+          else
+            echo "⚠️  No test script found in package.json, skipping"
+          fi
+      
+      # Set artifact name
+      - name: Set artifact name
+        id: set-artifact-name
+        run: |
+          REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          ARTIFACT_NAME="${REPO_NAME}-${{ github.sha }}"
+          echo "artifact-name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          echo "Artifact name: $ARTIFACT_NAME"
+      
+      # Upload artifacts
+      - name: Upload Java artifact
+        if: inputs.platform == 'java'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: target/*.jar
+          retention-days: 7
+      
+      - name: Upload Python artifact
+        if: inputs.platform == 'python'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: |
+            dist/*
+            requirements.txt
+          retention-days: 7
+      
+      - name: Upload Node.js artifact
+        if: inputs.platform == 'nodejs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: |
+            .
+            !node_modules
+            !.git
+            !tests
+            !*.md
+          retention-days: 7
+      
+      - name: Build summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "Build Summary"
+          echo "================================"
+          echo "Platform: ${{ inputs.platform }}"
+          echo "Version: ${{ inputs.java-version }}${{ inputs.python-version }}${{ inputs.node-version }}"
+          echo "Tests: ${{ inputs.run-tests }}"
+          echo "Artifact: ${{ steps.set-artifact-name.outputs.artifact-name }}"
+          echo "Status: ${{ job.status }}"
+          echo "================================"
