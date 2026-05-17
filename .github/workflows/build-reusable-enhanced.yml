@@ -1,0 +1,309 @@
+name: Build with Docker Image Support
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'Platform type: java, python, nodejs, docker, or docker-ecr'
+        required: true
+        type: string
+      docker-build-in-ci:
+        description: 'Build Docker image in GitHub Actions (requires docker-ecr platform)'
+        required: false
+        type: boolean
+        default: false
+      ecr-repository:
+        description: 'ECR repository name (required if docker-build-in-ci is true)'
+        required: false
+        type: string
+      java-version:
+        description: 'Java version (if platform is java)'
+        required: false
+        type: string
+        default: '17'
+      python-version:
+        description: 'Python version (if platform is python)'
+        required: false
+        type: string
+        default: '3.11'
+      node-version:
+        description: 'Node.js version (if platform is nodejs)'
+        required: false
+        type: string
+        default: '20'
+      run-tests:
+        description: 'Whether to run tests'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+      docker-image-uri:
+        description: 'Docker image URI (if docker-ecr platform)'
+        value: ${{ jobs.build.outputs.docker-image-uri }}
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_REGION:
+        required: false
+
+jobs:
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+      docker-image-uri: ${{ steps.docker-push.outputs.image-uri }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Java Build (existing)
+      - name: Set up JDK (Java)
+        if: inputs.platform == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'corretto'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+      
+      - name: Fix Maven wrapper permissions (Java)
+        if: inputs.platform == 'java'
+        run: |
+          if [ -f "./mvnw" ]; then
+            chmod +x ./mvnw
+            echo "✅ Maven wrapper permissions fixed"
+          fi
+      
+      - name: Build with Maven (Java)
+        if: inputs.platform == 'java'
+        run: |
+          if [ -f "./mvnw" ]; then
+            ./mvnw clean package -DskipTests=${{ inputs.run-tests == false }}
+          else
+            mvn clean package -DskipTests=${{ inputs.run-tests == false }}
+          fi
+      
+      - name: Run tests (Java)
+        if: inputs.platform == 'java' && inputs.run-tests
+        run: |
+          if [ -f "./mvnw" ]; then
+            ./mvnw test
+          else
+            mvn test
+          fi
+      
+      # Python Build (existing)
+      - name: Set up Python
+        if: inputs.platform == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+      
+      - name: Install Python dependencies
+        if: inputs.platform == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+      
+      - name: Run Python tests
+        if: inputs.platform == 'python' && inputs.run-tests
+        run: |
+          if [ -f pytest.ini ] || [ -d tests ]; then
+            pip install pytest pytest-cov
+            pytest --cov
+          fi
+      
+      # Node.js Build (existing)
+      - name: Set up Node.js
+        if: inputs.platform == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+      
+      - name: Install Node.js dependencies
+        if: inputs.platform == 'nodejs'
+        run: npm ci
+      
+      - name: Build Node.js application
+        if: inputs.platform == 'nodejs'
+        run: |
+          if grep -q "\"build\":" package.json; then
+            npm run build
+          fi
+      
+      - name: Run Node.js tests
+        if: inputs.platform == 'nodejs' && inputs.run-tests
+        run: |
+          if grep -q "\"test\":" package.json; then
+            npm test
+          fi
+      
+      # Docker Build (EB builds the image)
+      - name: Verify Dockerfile exists (Docker)
+        if: inputs.platform == 'docker'
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "❌ No Dockerfile found"
+            exit 1
+          fi
+          echo "✅ Dockerfile found"
+      
+      # Docker Build in CI/CD (Build image in GitHub Actions)
+      - name: Set up Docker Buildx (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Configure AWS credentials (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Login to Amazon ECR (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build and push Docker image (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        id: docker-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          echo "Building Docker image..."
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Push to ECR
+          echo "Pushing to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Output image URI
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "✅ Docker image pushed: $IMAGE_URI"
+      
+      - name: Scan Docker image for vulnerabilities (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        continue-on-error: true
+        run: |
+          # Install Trivy scanner
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy
+          
+          # Scan image
+          echo "Scanning Docker image for vulnerabilities..."
+          trivy image --severity HIGH,CRITICAL ${{ steps.docker-push.outputs.image-uri }}
+      
+      # Set artifact name
+      - name: Set artifact name
+        id: set-artifact-name
+        run: |
+          REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          ARTIFACT_NAME="${REPO_NAME}-${{ github.sha }}"
+          echo "artifact-name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+      
+      # Upload artifacts (existing)
+      - name: Upload Java artifact
+        if: inputs.platform == 'java'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: target/*.jar
+          retention-days: 7
+      
+      - name: Upload Python artifact
+        if: inputs.platform == 'python'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: |
+            dist/*
+            requirements.txt
+          retention-days: 7
+      
+      - name: Upload Node.js artifact
+        if: inputs.platform == 'nodejs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: |
+            .
+            !node_modules
+            !.git
+          retention-days: 7
+      
+      - name: Upload Docker artifact
+        if: inputs.platform == 'docker'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: |
+            .
+            !.git
+            !.github
+            !node_modules
+          retention-days: 7
+      
+      - name: Create Dockerrun.aws.json for ECR (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        run: |
+          cat > Dockerrun.aws.json <<EOF
+          {
+            "AWSEBDockerrunVersion": "1",
+            "Image": {
+              "Name": "${{ steps.docker-push.outputs.image-uri }}",
+              "Update": "true"
+            },
+            "Ports": [
+              {
+                "ContainerPort": 8080,
+                "HostPort": 8080
+              }
+            ]
+          }
+          EOF
+          
+          echo "✅ Created Dockerrun.aws.json"
+          cat Dockerrun.aws.json
+      
+      - name: Upload Dockerrun.aws.json (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact-name.outputs.artifact-name }}
+          path: Dockerrun.aws.json
+          retention-days: 7
+      
+      - name: Build summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "Build Summary"
+          echo "================================"
+          echo "Platform: ${{ inputs.platform }}"
+          echo "Tests: ${{ inputs.run-tests }}"
+          echo "Artifact: ${{ steps.set-artifact-name.outputs.artifact-name }}"
+          if [ "${{ inputs.platform }}" = "docker-ecr" ]; then
+            echo "Docker Image: ${{ steps.docker-push.outputs.image-uri }}"
+          fi
+          echo "Status: ${{ job.status }}"
+          echo "================================"
