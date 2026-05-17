@@ -1,0 +1,70 @@
+name: Enforce Branch Policy (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      allowed-source-pattern:
+        description: 'Glob pattern the PR source branch must match (e.g. release/*)'
+        required: true
+        type: string
+      target-branch:
+        description: 'Protected target branch this policy guards (e.g. main)'
+        required: true
+        type: string
+
+jobs:
+  enforce-policy:
+    name: Enforce Branch Policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate source branch against policy
+        run: |
+          SOURCE_BRANCH="${GITHUB_HEAD_REF}"
+          TARGET_BRANCH="${GITHUB_BASE_REF}"
+          ALLOWED_PATTERN="${{ inputs.allowed-source-pattern }}"
+          EXPECTED_TARGET="${{ inputs.target-branch }}"
+
+          echo "================================"
+          echo "Branch Policy Enforcement"
+          echo "================================"
+          echo "Source branch:   $SOURCE_BRANCH"
+          echo "Target branch:   $TARGET_BRANCH"
+          echo "Allowed pattern: $ALLOWED_PATTERN"
+          echo "Guarded target:  $EXPECTED_TARGET"
+          echo "================================"
+
+          # Only enforce when the PR targets the guarded branch
+          if [ "$TARGET_BRANCH" != "$EXPECTED_TARGET" ]; then
+            echo "ℹ️  PR does not target '$EXPECTED_TARGET' (targets '$TARGET_BRANCH'). Policy not applicable."
+            exit 0
+          fi
+
+          # Glob match: convert pattern to a shell case match
+          # shellcheck disable=SC2254
+          case "$SOURCE_BRANCH" in
+            $ALLOWED_PATTERN)
+              echo "✅ Source branch '$SOURCE_BRANCH' matches allowed pattern '$ALLOWED_PATTERN'"
+              echo "   Merge into '$EXPECTED_TARGET' is permitted."
+              ;;
+            *)
+              echo "❌ Branch policy violation"
+              echo "   Source branch '$SOURCE_BRANCH' is NOT allowed to merge into '$EXPECTED_TARGET'"
+              echo "   Only branches matching '$ALLOWED_PATTERN' may merge into '$EXPECTED_TARGET'"
+              echo ""
+              echo "   Typical flow:  feature/* -> release/* -> $EXPECTED_TARGET"
+              exit 1
+              ;;
+          esac
+
+      - name: Policy summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "Branch Policy Summary"
+          echo "================================"
+          echo "Source:  ${GITHUB_HEAD_REF}"
+          echo "Target:  ${GITHUB_BASE_REF}"
+          echo "Pattern: ${{ inputs.allowed-source-pattern }}"
+          echo "Result:  ${{ job.status }}"
+          echo "================================"

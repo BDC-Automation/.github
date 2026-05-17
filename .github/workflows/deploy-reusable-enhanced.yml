@@ -1,0 +1,346 @@
+name: Deploy with GitHub Deployment Tracking
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: 'Name of the artifact to deploy'
+        required: true
+        type: string
+      aws-region:
+        description: 'AWS region'
+        required: true
+        type: string
+      eb-application-name:
+        description: 'Elastic Beanstalk application name'
+        required: true
+        type: string
+      eb-environment-name:
+        description: 'Elastic Beanstalk environment name'
+        required: true
+        type: string
+      platform:
+        description: 'Platform type'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment name (dev/uat/prod) for GitHub tracking'
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.eb-environment-name }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Create GitHub Deployment
+      - name: Create GitHub Deployment
+        id: create-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: '${{ inputs.environment }}',
+              description: 'Deploy to ${{ inputs.eb-environment-name }}',
+              required_contexts: [],
+              auto_merge: false,
+              task: 'deploy',
+              payload: {
+                eb_application: '${{ inputs.eb-application-name }}',
+                eb_environment: '${{ inputs.eb-environment-name }}',
+                platform: '${{ inputs.platform }}',
+                triggered_by: context.actor
+              }
+            });
+            
+            console.log('✅ Deployment created:', deployment.data.id);
+            return deployment.data.id;
+      
+      # Set deployment status to in_progress
+      - name: Set deployment status to in_progress
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              state: 'in_progress',
+              description: 'Deployment started',
+              environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com'
+            });
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./artifact
+      
+      - name: Create deployment package (Java)
+        if: inputs.platform == 'java'
+        run: |
+          cd artifact
+          JAR_FILE=$(find . -name "*.jar" -type f | head -n 1)
+          if [ -z "$JAR_FILE" ]; then
+            echo "❌ No JAR file found"
+            exit 1
+          fi
+          zip -r ../deployment.zip .
+          cd ..
+      
+      - name: Create deployment package (Python)
+        if: inputs.platform == 'python'
+        run: |
+          cd artifact
+          zip -r ../deployment.zip .
+          cd ..
+      
+      - name: Create deployment package (Node.js)
+        if: inputs.platform == 'nodejs'
+        run: |
+          cd artifact
+          if [ -f package.json ]; then
+            npm ci --production
+          fi
+          zip -r ../deployment.zip .
+          cd ..
+      
+      - name: Create deployment package (Docker)
+        if: inputs.platform == 'docker'
+        run: |
+          cd artifact
+          if [ ! -f Dockerfile ]; then
+            echo "❌ No Dockerfile found"
+            exit 1
+          fi
+          zip -r ../deployment.zip .
+          cd ..
+      
+      - name: Use Dockerrun.aws.json (Docker ECR)
+        if: inputs.platform == 'docker-ecr'
+        run: |
+          cd artifact
+          if [ ! -f Dockerrun.aws.json ]; then
+            echo "❌ No Dockerrun.aws.json found"
+            exit 1
+          fi
+          zip -r ../deployment.zip Dockerrun.aws.json
+          cd ..
+          
+          echo "📦 Dockerrun.aws.json contents:"
+          unzip -p deployment.zip Dockerrun.aws.json
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws-region }}
+      
+      - name: Upload to S3
+        id: upload-s3
+        run: |
+          VERSION_LABEL="${{ inputs.eb-application-name }}-${{ github.sha }}-$(date +%Y%m%d-%H%M%S)"
+          echo "version-label=$VERSION_LABEL" >> $GITHUB_OUTPUT
+          
+          BUCKET_NAME="elasticbeanstalk-${{ inputs.aws-region }}-$(aws sts get-caller-identity --query Account --output text)"
+          
+          if ! aws s3 ls "s3://${BUCKET_NAME}" 2>&1 | grep -q 'NoSuchBucket'; then
+            echo "✅ S3 bucket exists: ${BUCKET_NAME}"
+          else
+            aws s3 mb "s3://${BUCKET_NAME}" --region ${{ inputs.aws-region }}
+          fi
+          
+          S3_KEY="${{ inputs.eb-application-name }}/${VERSION_LABEL}.zip"
+          aws s3 cp deployment.zip "s3://${BUCKET_NAME}/${S3_KEY}"
+          
+          echo "s3-bucket=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "s3-key=$S3_KEY" >> $GITHUB_OUTPUT
+      
+      - name: Create EB application version
+        run: |
+          VERSION_LABEL="${{ steps.upload-s3.outputs.version-label }}"
+          S3_BUCKET="${{ steps.upload-s3.outputs.s3-bucket }}"
+          S3_KEY="${{ steps.upload-s3.outputs.s3-key }}"
+          
+          aws elasticbeanstalk create-application-version \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+            --description "Deployed by ${{ github.actor }} - Commit: ${{ github.sha }}" \
+            --region ${{ inputs.aws-region }}
+      
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          VERSION_LABEL="${{ steps.upload-s3.outputs.version-label }}"
+          
+          aws elasticbeanstalk update-environment \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --environment-name "${{ inputs.eb-environment-name }}" \
+            --version-label "$VERSION_LABEL" \
+            --region ${{ inputs.aws-region }}
+      
+      - name: Wait for deployment
+        id: wait-deployment
+        run: |
+          echo "Waiting for environment to become ready..."
+          
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --application-name "${{ inputs.eb-application-name }}" \
+              --environment-names "${{ inputs.eb-environment-name }}" \
+              --region ${{ inputs.aws-region }} \
+              --query 'Environments[0].Status' \
+              --output text)
+            
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --application-name "${{ inputs.eb-application-name }}" \
+              --environment-names "${{ inputs.eb-environment-name }}" \
+              --region ${{ inputs.aws-region }} \
+              --query 'Environments[0].Health' \
+              --output text)
+            
+            echo "Status: $STATUS | Health: $HEALTH"
+            
+            if [ "$STATUS" = "Ready" ]; then
+              if [ "$HEALTH" = "Green" ]; then
+                echo "deployment-status=success" >> $GITHUB_OUTPUT
+                echo "✅ Deployment successful!"
+                break
+              elif [ "$HEALTH" = "Yellow" ]; then
+                echo "deployment-status=success" >> $GITHUB_OUTPUT
+                echo "⚠️  Deployment complete but health is Yellow"
+                break
+              else
+                echo "deployment-status=failure" >> $GITHUB_OUTPUT
+                echo "❌ Deployment complete but health is $HEALTH"
+                exit 1
+              fi
+            elif [ "$STATUS" = "Updating" ]; then
+              echo "Still updating... (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
+            else
+              echo "deployment-status=failure" >> $GITHUB_OUTPUT
+              echo "❌ Unexpected status: $STATUS"
+              exit 1
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "deployment-status=failure" >> $GITHUB_OUTPUT
+            echo "❌ Deployment timed out"
+            exit 1
+          fi
+      
+      - name: Get environment URL
+        id: get-url
+        run: |
+          ENV_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --environment-names "${{ inputs.eb-environment-name }}" \
+            --region ${{ inputs.aws-region }} \
+            --query 'Environments[0].CNAME' \
+            --output text)
+          
+          echo "environment-url=http://${ENV_URL}" >> $GITHUB_OUTPUT
+      
+      # Set deployment status to success
+      - name: Set deployment status to success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              state: 'success',
+              description: 'Deployment completed successfully',
+              environment_url: '${{ steps.get-url.outputs.environment-url }}',
+              log_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
+            
+            console.log('✅ Deployment marked as successful');
+            console.log('Environment URL: ${{ steps.get-url.outputs.environment-url }}');
+      
+      # Set deployment status to failure
+      - name: Set deployment status to failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              state: 'failure',
+              description: 'Deployment failed',
+              environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com',
+              log_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
+            
+            console.log('❌ Deployment marked as failed');
+      
+      # Create deployment summary
+      - name: Create deployment summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## 🚀 Deployment Summary
+          
+          **Environment:** \`${{ inputs.environment }}\`  
+          **Application:** \`${{ inputs.eb-application-name }}\`  
+          **EB Environment:** \`${{ inputs.eb-environment-name }}\`  
+          **Platform:** \`${{ inputs.platform }}\`  
+          **Version:** \`${{ steps.upload-s3.outputs.version-label }}\`  
+          **Commit:** \`${{ github.sha }}\`  
+          **Deployed by:** @${{ github.actor }}  
+          **URL:** ${{ steps.get-url.outputs.environment-url }}  
+          **Status:** ${{ job.status }}
+          
+          ### Deployment Details
+          - **AWS Region:** ${{ inputs.aws-region }}
+          - **S3 Bucket:** ${{ steps.upload-s3.outputs.s3-bucket }}
+          - **S3 Key:** ${{ steps.upload-s3.outputs.s3-key }}
+          
+          [View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+      
+      - name: Post deployment comment (on PR)
+        if: github.event_name == 'pull_request' && success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## ✅ Deployment Successful
+            
+            **Environment:** \`${{ inputs.environment }}\`
+            **URL:** ${{ steps.get-url.outputs.environment-url }}
+            **Version:** \`${{ steps.upload-s3.outputs.version-label }}\`
+            **Deployed by:** @${{ github.actor }}
+            
+            [View Deployment Details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
