@@ -37,7 +37,11 @@ jobs:
   deploy:
     name: Deploy to ${{ inputs.eb-environment-name }}
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+
     steps:
       # Create GitHub Deployment
       - name: Create GitHub Deployment
@@ -67,14 +71,16 @@ jobs:
       
       # Set deployment status to in_progress
       - name: Set deployment status to in_progress
-        if: always()
+        if: always() && steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.create-deployment.outputs.result }}
         with:
           script: |
             await github.rest.repos.createDeploymentStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'in_progress',
               description: 'Deployment started',
               environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com'
@@ -264,14 +270,16 @@ jobs:
       
       # Set deployment status to success
       - name: Set deployment status to success
-        if: success()
+        if: success() && steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.create-deployment.outputs.result }}
         with:
           script: |
             await github.rest.repos.createDeploymentStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'success',
               description: 'Deployment completed successfully',
               environment_url: '${{ steps.get-url.outputs.environment-url }}',
@@ -283,14 +291,16 @@ jobs:
       
       # Set deployment status to failure
       - name: Set deployment status to failure
-        if: failure()
+        if: failure() && steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
+        env:
+          DEPLOYMENT_ID: ${{ steps.create-deployment.outputs.result }}
         with:
           script: |
             await github.rest.repos.createDeploymentStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              deployment_id: ${{ steps.create-deployment.outputs.result }},
+              deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'failure',
               description: 'Deployment failed',
               environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com',

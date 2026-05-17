@@ -1,0 +1,279 @@
+name: Deploy to AWS Elastic Beanstalk
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: 'Name of the artifact to deploy'
+        required: true
+        type: string
+      aws-region:
+        description: 'AWS region (e.g., us-west-1)'
+        required: true
+        type: string
+      eb-application-name:
+        description: 'Elastic Beanstalk application name'
+        required: true
+        type: string
+      eb-environment-name:
+        description: 'Elastic Beanstalk environment name'
+        required: true
+        type: string
+      platform:
+        description: 'Platform type: java, python, or nodejs'
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.eb-environment-name }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code (for deployment scripts)
+        uses: actions/checkout@v4
+      
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./artifact
+      
+      - name: List downloaded files
+        run: |
+          echo "Downloaded artifact contents:"
+          ls -lah ./artifact
+      
+      - name: Create deployment package (Java)
+        if: inputs.platform == 'java'
+        run: |
+          cd artifact
+          
+          # Find the JAR file
+          JAR_FILE=$(find . -name "*.jar" -type f | head -n 1)
+          
+          if [ -z "$JAR_FILE" ]; then
+            echo "❌ No JAR file found in artifact"
+            exit 1
+          fi
+          
+          echo "Found JAR: $JAR_FILE"
+          
+          # Create deployment package
+          zip -r ../deployment.zip .
+          cd ..
+          
+          echo "✅ Deployment package created: deployment.zip"
+          ls -lh deployment.zip
+      
+      - name: Create deployment package (Python)
+        if: inputs.platform == 'python'
+        run: |
+          cd artifact
+          
+          # If there's already a wheel/zip, use it
+          if ls *.whl 1> /dev/null 2>&1 || ls *.zip 1> /dev/null 2>&1; then
+            cp *.whl ../deployment.zip 2>/dev/null || cp *.zip ../deployment.zip
+          else
+            # Create deployment package
+            zip -r ../deployment.zip .
+          fi
+          
+          cd ..
+          
+          echo "✅ Deployment package created: deployment.zip"
+          ls -lh deployment.zip
+      
+      - name: Create deployment package (Node.js)
+        if: inputs.platform == 'nodejs'
+        run: |
+          cd artifact
+          
+          # Install production dependencies
+          if [ -f package.json ]; then
+            npm ci --production
+          fi
+          
+          # Create deployment package
+          zip -r ../deployment.zip .
+          cd ..
+          
+          echo "✅ Deployment package created: deployment.zip"
+          ls -lh deployment.zip
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws-region }}
+      
+      - name: Upload to S3
+        id: upload-s3
+        run: |
+          # Generate version label
+          VERSION_LABEL="${{ inputs.eb-application-name }}-${{ github.sha }}-$(date +%Y%m%d-%H%M%S)"
+          echo "version-label=$VERSION_LABEL" >> $GITHUB_OUTPUT
+          
+          # Create S3 bucket if it doesn't exist
+          BUCKET_NAME="elasticbeanstalk-${{ inputs.aws-region }}-$(aws sts get-caller-identity --query Account --output text)"
+          
+          # Check if bucket exists
+          if ! aws s3 ls "s3://${BUCKET_NAME}" 2>&1 | grep -q 'NoSuchBucket'; then
+            echo "✅ S3 bucket exists: ${BUCKET_NAME}"
+          else
+            echo "Creating S3 bucket: ${BUCKET_NAME}"
+            aws s3 mb "s3://${BUCKET_NAME}" --region ${{ inputs.aws-region }}
+          fi
+          
+          # Upload deployment package
+          S3_KEY="${{ inputs.eb-application-name }}/${VERSION_LABEL}.zip"
+          aws s3 cp deployment.zip "s3://${BUCKET_NAME}/${S3_KEY}"
+          
+          echo "✅ Uploaded to s3://${BUCKET_NAME}/${S3_KEY}"
+          echo "s3-bucket=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "s3-key=$S3_KEY" >> $GITHUB_OUTPUT
+      
+      - name: Create Elastic Beanstalk application version
+        run: |
+          VERSION_LABEL="${{ steps.upload-s3.outputs.version-label }}"
+          S3_BUCKET="${{ steps.upload-s3.outputs.s3-bucket }}"
+          S3_KEY="${{ steps.upload-s3.outputs.s3-key }}"
+          
+          echo "Creating application version: $VERSION_LABEL"
+          
+          aws elasticbeanstalk create-application-version \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+            --description "Deployed from GitHub Actions - ${{ github.sha }}" \
+            --region ${{ inputs.aws-region }}
+          
+          echo "✅ Application version created: $VERSION_LABEL"
+      
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          VERSION_LABEL="${{ steps.upload-s3.outputs.version-label }}"
+          
+          echo "Deploying version $VERSION_LABEL to ${{ inputs.eb-environment-name }}"
+          
+          aws elasticbeanstalk update-environment \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --environment-name "${{ inputs.eb-environment-name }}" \
+            --version-label "$VERSION_LABEL" \
+            --region ${{ inputs.aws-region }}
+          
+          echo "✅ Deployment initiated"
+      
+      - name: Wait for deployment to complete
+        run: |
+          echo "Waiting for environment to become ready..."
+          
+          MAX_ATTEMPTS=60  # 30 minutes (30 seconds * 60)
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --application-name "${{ inputs.eb-application-name }}" \
+              --environment-names "${{ inputs.eb-environment-name }}" \
+              --region ${{ inputs.aws-region }} \
+              --query 'Environments[0].Status' \
+              --output text)
+            
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --application-name "${{ inputs.eb-application-name }}" \
+              --environment-names "${{ inputs.eb-environment-name }}" \
+              --region ${{ inputs.aws-region }} \
+              --query 'Environments[0].Health' \
+              --output text)
+            
+            echo "Status: $STATUS | Health: $HEALTH"
+            
+            if [ "$STATUS" = "Ready" ]; then
+              if [ "$HEALTH" = "Green" ]; then
+                echo "✅ Deployment successful! Environment is Ready and Healthy"
+                break
+              elif [ "$HEALTH" = "Yellow" ]; then
+                echo "⚠️  Deployment complete but health is Yellow"
+                break
+              else
+                echo "❌ Deployment complete but health is $HEALTH"
+                exit 1
+              fi
+            elif [ "$STATUS" = "Updating" ]; then
+              echo "Still updating... (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
+            else
+              echo "❌ Unexpected status: $STATUS"
+              exit 1
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Deployment timed out after 30 minutes"
+            exit 1
+          fi
+      
+      - name: Get environment URL
+        id: get-url
+        run: |
+          ENV_URL=$(aws elasticbeanstalk describe-environments \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --environment-names "${{ inputs.eb-environment-name }}" \
+            --region ${{ inputs.aws-region }} \
+            --query 'Environments[0].CNAME' \
+            --output text)
+          
+          echo "environment-url=http://${ENV_URL}" >> $GITHUB_OUTPUT
+          echo "Environment URL: http://${ENV_URL}"
+      
+      - name: Health check
+        run: |
+          ENV_URL="${{ steps.get-url.outputs.environment-url }}"
+          
+          echo "Running health check on: $ENV_URL"
+          
+          # Try to hit the root endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENV_URL" || echo "000")
+          
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+            echo "✅ Health check passed (HTTP $HTTP_CODE)"
+          else
+            echo "⚠️  Health check returned HTTP $HTTP_CODE"
+            echo "   This might be expected if your app doesn't have a root endpoint"
+            echo "   Verify your application manually: $ENV_URL"
+          fi
+      
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "Deployment Summary"
+          echo "================================"
+          echo "Application: ${{ inputs.eb-application-name }}"
+          echo "Environment: ${{ inputs.eb-environment-name }}"
+          echo "Region: ${{ inputs.aws-region }}"
+          echo "Version: ${{ steps.upload-s3.outputs.version-label }}"
+          echo "URL: ${{ steps.get-url.outputs.environment-url }}"
+          echo "Status: ${{ job.status }}"
+          echo "================================"
+      
+      - name: Deployment failed - Check logs
+        if: failure()
+        run: |
+          echo "❌ Deployment failed. Fetching recent events..."
+          
+          aws elasticbeanstalk describe-events \
+            --application-name "${{ inputs.eb-application-name }}" \
+            --environment-name "${{ inputs.eb-environment-name }}" \
+            --region ${{ inputs.aws-region }} \
+            --max-items 20 \
+            --query 'Events[*].[EventDate,Severity,Message]' \
+            --output table
