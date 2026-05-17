@@ -8,19 +8,16 @@ on:
         required: true
         type: string
       date-format:
-        description: 'How the release suffix is interpreted for ordering: "date" (YYYYMMDD / sortable) or "semver"'
+        description: >-
+          How the release suffix is ordered: "date" (DD-MM-YYYY release dates,
+          normalized to YYYYMMDD for correct chronological ordering) or "semver".
         required: false
         type: string
         default: 'date'
-      auto-merge-label:
-        description: 'Label applied to the cascade PR so downstream automation can auto-merge it'
-        required: false
-        type: string
-        default: 'auto-merge'
 
+# No PRs are created, so only write access to repo contents is needed.
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   cascade-merge:
@@ -33,7 +30,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine current release branch
+      - name: Fetch all branches
+        run: git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
+
+      - name: Determine current (just-pushed) release branch
         id: current
         run: |
           BRANCH="${GITHUB_REF#refs/heads/}"
@@ -41,55 +41,77 @@ jobs:
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           PREFIX="${{ inputs.branch-pattern }}"
-          PREFIX="${PREFIX%\*}"   # strip trailing * -> "release/"
+          PREFIX="${PREFIX%\*}"   # "release/*" -> "release/"
           echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
-
-          SUFFIX="${BRANCH#${PREFIX}}"
-          echo "Release suffix: $SUFFIX"
-          echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+          echo "suffix=${BRANCH#${PREFIX}}" >> "$GITHUB_OUTPUT"
 
       - name: Find the next newer release branch
         id: target
         run: |
+          set -euo pipefail
           PREFIX="${{ steps.current.outputs.prefix }}"
           CURRENT="${{ steps.current.outputs.suffix }}"
           MODE="${{ inputs.date-format }}"
 
-          # All remote release branches, suffix only
+          # Normalize a suffix to a sortable key.
+          # DD-MM-YYYY -> YYYYMMDD so string sort == chronological order.
+          norm() {
+            local s="$1"
+            if [[ "$s" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]]; then
+              echo "${BASH_REMATCH[3]}${BASH_REMATCH[2]}${BASH_REMATCH[1]}"
+            else
+              echo "$s"
+            fi
+          }
+
           mapfile -t SUFFIXES < <(
             git for-each-ref --format='%(refname:short)' "refs/remotes/origin/${PREFIX}*" \
               | sed "s|^origin/||" \
               | sed "s|^${PREFIX}||" \
-              | grep -v '^$' \
-              | sort -u
+              | grep -v '^$' | sort -u
           )
 
-          echo "Discovered release suffixes: ${SUFFIXES[*]:-<none>}"
+          echo "Discovered release branches (suffixes): ${SUFFIXES[*]:-<none>}"
 
+          # Guard: if this is the only release branch, do nothing at all.
+          if [ "${#SUFFIXES[@]}" -le 1 ]; then
+            echo "ℹ️  '${PREFIX}${CURRENT}' is the only release branch."
+            echo "    No newer release branch exists -> nothing is merged or pushed."
+            echo "has-target=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT_KEY="$(norm "$CURRENT")"
+
+          # Build "key<TAB>suffix" lines and order them.
+          PAIRS=""
+          for s in "${SUFFIXES[@]}"; do
+            PAIRS+="$(norm "$s")\t$s\n"
+          done
           if [ "$MODE" = "semver" ]; then
-            SORTED=$(printf '%s\n' "${SUFFIXES[@]}" | sort -V)
+            SORTED=$(printf '%b' "$PAIRS" | sort -V)
           else
-            # date / lexicographic (YYYYMMDD sorts correctly lexically)
-            SORTED=$(printf '%s\n' "${SUFFIXES[@]}" | sort)
+            SORTED=$(printf '%b' "$PAIRS" | LC_ALL=C sort)
           fi
 
           NEXT=""
-          while IFS= read -r s; do
-            [ -z "$s" ] && continue
-            # First suffix strictly greater than the current one
+          while IFS=$'\t' read -r key suffix; do
+            [ -z "${suffix:-}" ] && continue
+            [ "$suffix" = "$CURRENT" ] && continue
             if [ "$MODE" = "semver" ]; then
-              GREATER=$(printf '%s\n%s\n' "$CURRENT" "$s" | sort -V | tail -n1)
+              GREATER=$(printf '%s\n%s\n' "$CURRENT" "$suffix" | sort -V | tail -n1)
+              [ "$GREATER" = "$suffix" ] || continue
             else
-              GREATER=$(printf '%s\n%s\n' "$CURRENT" "$s" | sort | tail -n1)
+              # strictly greater normalized key == strictly newer date
+              [[ "$key" > "$CURRENT_KEY" ]] || continue
             fi
-            if [ "$s" != "$CURRENT" ] && [ "$GREATER" = "$s" ]; then
-              NEXT="$s"
-              break
-            fi
+            NEXT="$suffix"
+            break
           done <<< "$SORTED"
 
           if [ -z "$NEXT" ]; then
-            echo "ℹ️  No newer release branch than '${PREFIX}${CURRENT}'. Nothing to cascade."
+            echo "ℹ️  '${PREFIX}${CURRENT}' is already the newest release branch."
+            echo "    Nothing newer to cascade into -> nothing is merged or pushed."
             echo "has-target=false" >> "$GITHUB_OUTPUT"
           else
             echo "✅ Next newer release branch: ${PREFIX}${NEXT}"
@@ -97,40 +119,35 @@ jobs:
             echo "target-branch=${PREFIX}${NEXT}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create cascade pull request
+      - name: Auto-merge into the next newer release branch (no PR)
         if: steps.target.outputs.has-target == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           SOURCE="${{ steps.current.outputs.branch }}"
           TARGET="${{ steps.target.outputs.target-branch }}"
-          LABEL="${{ inputs.auto-merge-label }}"
 
-          echo "Cascading $SOURCE -> $TARGET"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Skip if branches are already in sync
           if git diff --quiet "origin/${TARGET}" "origin/${SOURCE}"; then
-            echo "ℹ️  '$SOURCE' and '$TARGET' are identical. No PR needed."
+            echo "ℹ️  '${SOURCE}' and '${TARGET}' are already identical. Nothing to merge."
             exit 0
           fi
 
-          # Reuse an existing open PR if one is already present
-          EXISTING=$(gh pr list --head "$SOURCE" --base "$TARGET" --state open --json number --jq '.[0].number' || true)
-          if [ -n "$EXISTING" ]; then
-            echo "ℹ️  PR #$EXISTING already open for $SOURCE -> $TARGET. Skipping creation."
-            exit 0
+          echo "Auto-merging ${SOURCE} -> ${TARGET} (direct merge + push, no pull request)"
+          git checkout -B "$TARGET" "origin/${TARGET}"
+
+          if git merge --no-edit "origin/${SOURCE}"; then
+            git push origin "HEAD:${TARGET}"
+            echo "✅ Auto-merged and pushed: ${SOURCE} -> ${TARGET}"
+            echo "   The push to ${TARGET} re-triggers this workflow, which cascades to the next newer branch."
+          else
+            git merge --abort || true
+            echo "❌ Merge conflict between '${SOURCE}' and '${TARGET}'."
+            echo "   Per policy NO pull request is created; conflicts must be resolved manually"
+            echo "   (e.g. merge '${SOURCE}' into '${TARGET}' locally, resolve, and push)."
+            exit 1
           fi
-
-          gh label create "$LABEL" --color "0E8A16" --description "Cascade auto-merge" 2>/dev/null || true
-
-          gh pr create \
-            --head "$SOURCE" \
-            --base "$TARGET" \
-            --title "Cascade: merge ${SOURCE} into ${TARGET}" \
-            --body "Automated cascade merge of \`${SOURCE}\` into the newer release branch \`${TARGET}\`. This keeps newer release branches up to date with fixes landed on older ones." \
-            --label "$LABEL"
-
-          echo "✅ Cascade PR created: $SOURCE -> $TARGET (label: $LABEL)"
 
       - name: Cascade summary
         if: always()
@@ -138,9 +155,9 @@ jobs:
           echo "================================"
           echo "Auto-Merge Release Summary"
           echo "================================"
-          echo "Source branch: ${{ steps.current.outputs.branch }}"
+          echo "Source branch:    ${{ steps.current.outputs.branch }}"
           echo "Has newer target: ${{ steps.target.outputs.has-target }}"
-          echo "Target branch: ${{ steps.target.outputs.target-branch }}"
-          echo "Mode: ${{ inputs.date-format }}"
-          echo "Result: ${{ job.status }}"
+          echo "Target branch:    ${{ steps.target.outputs.target-branch }}"
+          echo "Mode:             ${{ inputs.date-format }}"
+          echo "Result:           ${{ job.status }}"
           echo "================================"
