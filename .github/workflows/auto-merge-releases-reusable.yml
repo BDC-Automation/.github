@@ -1,0 +1,146 @@
+name: Auto-Merge Release Branches (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      branch-pattern:
+        description: 'Prefix identifying release branches (e.g. release/*)'
+        required: true
+        type: string
+      date-format:
+        description: 'How the release suffix is interpreted for ordering: "date" (YYYYMMDD / sortable) or "semver"'
+        required: false
+        type: string
+        default: 'date'
+      auto-merge-label:
+        description: 'Label applied to the cascade PR so downstream automation can auto-merge it'
+        required: false
+        type: string
+        default: 'auto-merge'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cascade-merge:
+    name: Cascade Merge to Newer Releases
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine current release branch
+        id: current
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "Pushed branch: $BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          PREFIX="${{ inputs.branch-pattern }}"
+          PREFIX="${PREFIX%\*}"   # strip trailing * -> "release/"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+
+          SUFFIX="${BRANCH#${PREFIX}}"
+          echo "Release suffix: $SUFFIX"
+          echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Find the next newer release branch
+        id: target
+        run: |
+          PREFIX="${{ steps.current.outputs.prefix }}"
+          CURRENT="${{ steps.current.outputs.suffix }}"
+          MODE="${{ inputs.date-format }}"
+
+          # All remote release branches, suffix only
+          mapfile -t SUFFIXES < <(
+            git for-each-ref --format='%(refname:short)' "refs/remotes/origin/${PREFIX}*" \
+              | sed "s|^origin/||" \
+              | sed "s|^${PREFIX}||" \
+              | grep -v '^$' \
+              | sort -u
+          )
+
+          echo "Discovered release suffixes: ${SUFFIXES[*]:-<none>}"
+
+          if [ "$MODE" = "semver" ]; then
+            SORTED=$(printf '%s\n' "${SUFFIXES[@]}" | sort -V)
+          else
+            # date / lexicographic (YYYYMMDD sorts correctly lexically)
+            SORTED=$(printf '%s\n' "${SUFFIXES[@]}" | sort)
+          fi
+
+          NEXT=""
+          while IFS= read -r s; do
+            [ -z "$s" ] && continue
+            # First suffix strictly greater than the current one
+            if [ "$MODE" = "semver" ]; then
+              GREATER=$(printf '%s\n%s\n' "$CURRENT" "$s" | sort -V | tail -n1)
+            else
+              GREATER=$(printf '%s\n%s\n' "$CURRENT" "$s" | sort | tail -n1)
+            fi
+            if [ "$s" != "$CURRENT" ] && [ "$GREATER" = "$s" ]; then
+              NEXT="$s"
+              break
+            fi
+          done <<< "$SORTED"
+
+          if [ -z "$NEXT" ]; then
+            echo "ℹ️  No newer release branch than '${PREFIX}${CURRENT}'. Nothing to cascade."
+            echo "has-target=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Next newer release branch: ${PREFIX}${NEXT}"
+            echo "has-target=true" >> "$GITHUB_OUTPUT"
+            echo "target-branch=${PREFIX}${NEXT}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create cascade pull request
+        if: steps.target.outputs.has-target == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SOURCE="${{ steps.current.outputs.branch }}"
+          TARGET="${{ steps.target.outputs.target-branch }}"
+          LABEL="${{ inputs.auto-merge-label }}"
+
+          echo "Cascading $SOURCE -> $TARGET"
+
+          # Skip if branches are already in sync
+          if git diff --quiet "origin/${TARGET}" "origin/${SOURCE}"; then
+            echo "ℹ️  '$SOURCE' and '$TARGET' are identical. No PR needed."
+            exit 0
+          fi
+
+          # Reuse an existing open PR if one is already present
+          EXISTING=$(gh pr list --head "$SOURCE" --base "$TARGET" --state open --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "ℹ️  PR #$EXISTING already open for $SOURCE -> $TARGET. Skipping creation."
+            exit 0
+          fi
+
+          gh label create "$LABEL" --color "0E8A16" --description "Cascade auto-merge" 2>/dev/null || true
+
+          gh pr create \
+            --head "$SOURCE" \
+            --base "$TARGET" \
+            --title "Cascade: merge ${SOURCE} into ${TARGET}" \
+            --body "Automated cascade merge of \`${SOURCE}\` into the newer release branch \`${TARGET}\`. This keeps newer release branches up to date with fixes landed on older ones." \
+            --label "$LABEL"
+
+          echo "✅ Cascade PR created: $SOURCE -> $TARGET (label: $LABEL)"
+
+      - name: Cascade summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "Auto-Merge Release Summary"
+          echo "================================"
+          echo "Source branch: ${{ steps.current.outputs.branch }}"
+          echo "Has newer target: ${{ steps.target.outputs.has-target }}"
+          echo "Target branch: ${{ steps.target.outputs.target-branch }}"
+          echo "Mode: ${{ inputs.date-format }}"
+          echo "Result: ${{ job.status }}"
+          echo "================================"
