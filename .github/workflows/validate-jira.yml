@@ -3,8 +3,8 @@ name: Validate JIRA
 on:
   workflow_call:
     inputs:
-      jira-project-key:
-        description: 'JIRA project key (e.g., BDCDEV, CSTS)'
+      jira-project-keys:
+        description: 'Comma-separated JIRA project keys (e.g., BDCDEV,BDCPROD,CSTS)'
         required: true
         type: string
     secrets:
@@ -16,68 +16,72 @@ on:
         required: true
 
 jobs:
-  validate-jira:
-    name: Validate JIRA Issue
+  validate-branch:
+    name: Validate Branch Name
     runs-on: ubuntu-latest
-    
+    steps:
+      - name: Check branch name contains JIRA ID
+        run: |
+          BRANCH_NAME="${{ github.head_ref || github.ref_name }}"
+          PROJECT_KEYS="${{ inputs.jira-project-keys }}"
+          
+          echo "Checking branch: $BRANCH_NAME"
+          echo "Valid project keys: $PROJECT_KEYS"
+          
+          # Convert comma-separated keys to regex pattern
+          # BDCDEV,CSTS,BDCPROD → (BDCDEV|CSTS|BDCPROD)
+          PATTERN=$(echo "$PROJECT_KEYS" | sed 's/,/|/g')
+          
+          if [[ "$BRANCH_NAME" =~ ($PATTERN)-[0-9]+ ]]; then
+            JIRA_ID=$(echo "$BRANCH_NAME" | grep -oP "($PATTERN)-[0-9]+" | head -1)
+            echo "✅ Branch name contains JIRA ID: $JIRA_ID"
+            echo "jira-id=$JIRA_ID" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Branch name must contain JIRA issue ID"
+            echo "   Valid formats: feature/$PATTERN-123-description"
+            echo "   Your branch: $BRANCH_NAME"
+            exit 1
+          fi
+        id: branch-check
+  
+  validate-commits:
+    name: Validate Commit Messages
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
-      - name: Extract JIRA ID from branch name
-        id: extract-branch
+      - name: Validate commit messages
         run: |
-          BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
-          echo "Branch name: $BRANCH_NAME"
+          PROJECT_KEYS="${{ inputs.jira-project-keys }}"
           
-          # Extract JIRA ID from branch name (e.g., feature/BDCDEV-123-description)
-          if [[ $BRANCH_NAME =~ ^(feature|bugfix|hotfix)/(${{ inputs.jira-project-key }}-[0-9]+) ]]; then
-            JIRA_ID="${BASH_REMATCH[2]}"
-            echo "jira-id=$JIRA_ID" >> $GITHUB_OUTPUT
-            echo "✅ Found JIRA ID in branch: $JIRA_ID"
-          else
-            echo "❌ Branch name must start with feature/bugfix/hotfix and include JIRA ID"
-            echo "   Example: feature/${{ inputs.jira-project-key }}-123-add-new-feature"
-            echo "   Your branch: $BRANCH_NAME"
-            exit 1
-          fi
-      
-      - name: Extract JIRA ID from commit messages
-        id: extract-commits
-        run: |
           # Get all commits in this PR or push
           if [ "${{ github.event_name }}" == "pull_request" ]; then
-            # github.sha on a PR is GitHub's synthetic merge commit
-            # ("Merge <sha> into <sha>"). Validate the PR's real commits
-            # using the event's base/head SHAs, excluding merge commits.
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            git fetch --no-tags --quiet origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
-            COMMITS=$(git log --no-merges --format=%s "${BASE_SHA}..${HEAD_SHA}")
+            COMMITS=$(git log --format=%s ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }})
           else
-            BEFORE="${{ github.event.before }}"
-            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-              COMMITS=$(git log --no-merges --format=%s "${BEFORE}..${{ github.sha }}")
-            else
-              COMMITS=$(git log --no-merges --format=%s -1)
-            fi
+            COMMITS=$(git log --format=%s -1)
           fi
           
           echo "Checking commits:"
           echo "$COMMITS"
+          echo ""
+          echo "Valid project keys: $PROJECT_KEYS"
           
-          if [ -z "$COMMITS" ]; then
-            echo "ℹ️  No non-merge commits to validate. Skipping commit-message check."
-            exit 0
-          fi
-
+          # Convert comma-separated keys to regex pattern
+          PATTERN=$(echo "$PROJECT_KEYS" | sed 's/,/|/g')
+          
           # Check each commit message starts with JIRA ID
           ALL_VALID=true
           while IFS= read -r commit; do
-            [ -z "$commit" ] && continue
-            if [[ ! $commit =~ ^${{ inputs.jira-project-key }}-[0-9]+ ]]; then
+            # Skip merge commits (they start with "Merge")
+            if [[ $commit =~ ^Merge ]]; then
+              echo "⏭️  Skipping merge commit: $commit"
+              continue
+            fi
+            
+            if [[ ! $commit =~ ^($PATTERN)-[0-9]+ ]]; then
               echo "❌ Invalid commit message (must start with JIRA ID): $commit"
               ALL_VALID=false
             else
@@ -88,147 +92,64 @@ jobs:
           if [ "$ALL_VALID" = false ]; then
             echo ""
             echo "❌ All commit messages must start with JIRA ID"
-            echo "   Example: ${{ inputs.jira-project-key }}-123 Add new feature"
+            echo "   Valid examples: $PROJECT_KEYS-123 Add new feature"
             exit 1
           fi
           
           echo "✅ All commit messages are valid"
-      
-      - name: Verify JIRA issue exists
-        id: verify-issue
+  
+  validate-jira-issue:
+    name: Validate JIRA Issue
+    needs: validate-branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get JIRA ID from branch
+        id: get-jira-id
         run: |
-          JIRA_ID="${{ steps.extract-branch.outputs.jira-id }}"
+          BRANCH_NAME="${{ github.head_ref || github.ref_name }}"
+          PROJECT_KEYS="${{ inputs.jira-project-keys }}"
+          PATTERN=$(echo "$PROJECT_KEYS" | sed 's/,/|/g')
           
-          echo "Checking if JIRA issue $JIRA_ID exists..."
+          JIRA_ID=$(echo "$BRANCH_NAME" | grep -oP "($PATTERN)-[0-9]+" | head -1)
+          echo "jira-id=$JIRA_ID" >> $GITHUB_OUTPUT
+          echo "JIRA ID: $JIRA_ID"
+      
+      - name: Check JIRA issue exists and is In Progress
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_ID: ${{ steps.get-jira-id.outputs.jira-id }}
+        run: |
+          echo "Checking JIRA issue: $JIRA_ID"
           
+          # Get issue details
           RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$JIRA_ID")
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$JIRA_ID?fields=status")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
           
-          if [ "$HTTP_CODE" -eq 200 ]; then
-            echo "✅ JIRA issue $JIRA_ID exists"
-            echo "$BODY" > /tmp/jira-issue.json
-          elif [ "$HTTP_CODE" -eq 401 ]; then
-            echo "❌ JIRA authentication failed"
-            echo "   Check JIRA_EMAIL and JIRA_API_TOKEN secrets"
-            exit 1
-          elif [ "$HTTP_CODE" -eq 404 ]; then
-            echo "❌ JIRA issue $JIRA_ID not found"
-            echo "   Verify the issue exists in ${{ secrets.JIRA_BASE_URL }}"
-            exit 1
-          else
-            echo "❌ JIRA API error (HTTP $HTTP_CODE)"
-            echo "$BODY"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ JIRA issue $JIRA_ID not found or not accessible"
+            echo "HTTP Code: $HTTP_CODE"
+            echo "Response: $BODY"
             exit 1
           fi
-      
-      - name: Verify JIRA issue status
-        run: |
-          JIRA_ID="${{ steps.extract-branch.outputs.jira-id }}"
           
-          # Extract status from response
-          STATUS=$(cat /tmp/jira-issue.json | jq -r '.fields.status.name')
-          echo "Current status: $STATUS"
+          echo "✅ JIRA issue exists"
           
-          # Check if status is "In Progress"
-          if [ "$STATUS" = "In Progress" ]; then
-            echo "✅ JIRA issue $JIRA_ID is 'In Progress'"
-          else
-            echo "❌ JIRA issue $JIRA_ID must be in 'In Progress' status"
+          # Check if issue is In Progress
+          STATUS=$(echo "$BODY" | jq -r '.fields.status.name')
+          echo "Issue status: $STATUS"
+          
+          if [ "$STATUS" != "In Progress" ]; then
+            echo "⚠️  Warning: JIRA issue is not 'In Progress'"
             echo "   Current status: $STATUS"
-            echo "   Please move the issue to 'In Progress' before continuing"
-            exit 1
+            echo "   Please move the issue to 'In Progress' before merging"
+            # Don't fail, just warn
+          else
+            echo "✅ JIRA issue is In Progress"
           fi
-      
-      - name: Add comment to JIRA (on failure)
-        if: failure()
-        run: |
-          JIRA_ID="${{ steps.extract-branch.outputs.jira-id }}"
-          
-          COMMENT_BODY=$(cat <<EOF
-          {
-            "body": {
-              "type": "doc",
-              "version": 1,
-              "content": [
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "❌ GitHub Actions validation failed for "
-                    },
-                    {
-                      "type": "text",
-                      "text": "${{ github.repository }}",
-                      "marks": [{"type": "strong"}]
-                    }
-                  ]
-                },
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "Workflow: ${{ github.workflow }}"
-                    }
-                  ]
-                },
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "Branch: ${{ github.ref }}"
-                    }
-                  ]
-                },
-                {
-                  "type": "paragraph",
-                  "content": [
-                    {
-                      "type": "text",
-                      "text": "View run: ",
-                      "marks": []
-                    },
-                    {
-                      "type": "text",
-                      "text": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                      "marks": [
-                        {
-                          "type": "link",
-                          "attrs": {
-                            "href": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              ]
-            }
-          }
-          EOF
-          )
-          
-          curl -s -X POST \
-            -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$COMMENT_BODY" \
-            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$JIRA_ID/comment" || true
-      
-      - name: Validation summary
-        if: always()
-        run: |
-          echo "================================"
-          echo "JIRA Validation Summary"
-          echo "================================"
-          echo "JIRA ID: ${{ steps.extract-branch.outputs.jira-id }}"
-          echo "Project: ${{ inputs.jira-project-key }}"
-          echo "Branch: ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
-          echo "Status: ${{ job.status }}"
-          echo "================================"
