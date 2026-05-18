@@ -1,0 +1,25 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+
+jobs:
+  validate-jira:
+    name: Validate JIRA
+    uses: BDC-Automation/.github/.github/workflows/validate-jira.yml@master
+    with:
+      jira-project-key: 'BDCDEV'
+    secrets:
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  
+  enforce-branch-policy:
+    name: Validate Source Branch
+    uses: BDC-Automation/.github/.github/workflows/enforce-branch-policy-reusable.yml@master
+    with:
+      target-branch: ${{ github.base_ref }}
