@@ -23,75 +23,67 @@ jobs:
         env:
           SOURCE_BRANCH: ${{ github.head_ref }}
           TARGET_BRANCH: ${{ github.base_ref }}
-          ALLOWED_PATTERN: ${{ inputs.allowed-source-pattern }}
-          CONFIGURED_TARGET: ${{ inputs.target-branch }}
         run: |
           echo "================================"
           echo "Branch Policy Check"
           echo "================================"
           echo "Source: $SOURCE_BRANCH"
           echo "Target: $TARGET_BRANCH"
-          echo "Allowed pattern: $ALLOWED_PATTERN"
           echo ""
           
-          # Only enforce if target is the configured target branch
-          if [[ "$TARGET_BRANCH" != "$CONFIGURED_TARGET" ]]; then
+          # Only enforce policy for PRs targeting 'main'
+          if [[ "$TARGET_BRANCH" != "main" ]]; then
             echo "✅ Policy not enforced for target: $TARGET_BRANCH"
-            echo "   (Policy only applies to: $CONFIGURED_TARGET)"
+            echo "   (Branch policy only applies to 'main')"
+            echo ""
+            echo "Allowed workflows:"
+            echo "  feature/* → $TARGET_BRANCH ✅"
+            echo "  Any branch → $TARGET_BRANCH ✅"
             exit 0
           fi
           
-          # Check if source branch matches allowed pattern
-          case "$SOURCE_BRANCH" in
-            $ALLOWED_PATTERN)
-              echo "✅ ALLOWED: Source branch matches allowed pattern"
-              echo ""
-              echo "Branch Policy:"
-              echo "  ✅ $ALLOWED_PATTERN → $TARGET_BRANCH (ALLOWED)"
-              echo "  ❌ feature/*   → $TARGET_BRANCH (BLOCKED)"
-              echo "  ❌ hotfix/*    → $TARGET_BRANCH (BLOCKED)"
-              echo "  ❌ Other       → $TARGET_BRANCH (BLOCKED)"
-              echo ""
-              echo "This is a valid source branch."
-              exit 0
-              ;;
-            *)
-              echo "❌ BLOCKED: Source branch doesn't match allowed pattern"
-              echo ""
-              echo "ERROR: Branch '$SOURCE_BRANCH' cannot target '$TARGET_BRANCH'"
-              echo ""
-              echo "================================================"
-              echo "CORRECT WORKFLOW:"
-              echo "================================================"
-              echo ""
-              echo "1. Create feature branch from develop:"
-              echo "   git checkout develop"
-              echo "   git checkout -b feature/JIRA-123-description"
-              echo ""
-              echo "2. Create PR to develop (NOT $TARGET_BRANCH):"
-              echo "   feature/JIRA-123 → develop ✅"
-              echo ""
-              echo "3. After merging to develop, create release:"
-              echo "   git checkout develop"
-              echo "   git checkout -b release/v1.0.0"
-              echo ""
-              echo "4. Create PR to $TARGET_BRANCH from release branch:"
-              echo "   release/v1.0.0 → $TARGET_BRANCH ✅"
-              echo ""
-              echo "================================================"
-              echo "ALLOWED WORKFLOW:"
-              echo "================================================"
-              echo "  feature/* → develop ✅"
-              echo "  develop   → release/* ✅"
-              echo "  $ALLOWED_PATTERN → $TARGET_BRANCH ✅"
-              echo ""
-              echo "================================================"
-              echo "BLOCKED WORKFLOW (YOUR CURRENT PR):"
-              echo "================================================"
-              echo "  $SOURCE_BRANCH → $TARGET_BRANCH ❌ (NOT ALLOWED)"
-              echo ""
-              echo "Please close this PR and create a new one targeting 'develop' instead."
-              echo ""
-              exit 1
-              ;;
-          esac
+          # For PRs targeting 'main', only allow release branches
+          if [[ "$SOURCE_BRANCH" =~ ^release/ ]]; then
+            echo "✅ ALLOWED: Release branch can merge to main"
+            echo ""
+            echo "Branch Policy for 'main':"
+            echo "  ✅ release/* → main (ALLOWED)"
+            echo "  ❌ feature/* → main (BLOCKED)"
+            echo "  ❌ hotfix/*  → main (BLOCKED)"
+            echo "  ❌ develop   → main (BLOCKED)"
+            echo ""
+            echo "This PR is allowed."
+            exit 0
+          else
+            echo "❌ BLOCKED: Only release branches can merge to main"
+            echo ""
+            echo "ERROR: Branch '$SOURCE_BRANCH' cannot target 'main'"
+            echo ""
+            echo "================================================"
+            echo "CORRECT WORKFLOW:"
+            echo "================================================"
+            echo ""
+            echo "1. Merge your feature branch to a release branch:"
+            echo "   git checkout release/DD-MM-YYYY"
+            echo "   git merge $SOURCE_BRANCH"
+            echo "   git push"
+            echo ""
+            echo "2. Create PR from release branch to main:"
+            echo "   release/DD-MM-YYYY → main ✅"
+            echo ""
+            echo "================================================"
+            echo "ALLOWED WORKFLOWS:"
+            echo "================================================"
+            echo "  feature/* → release/* ✅"
+            echo "  feature/* → develop   ✅"
+            echo "  release/* → main      ✅"
+            echo ""
+            echo "================================================"
+            echo "BLOCKED WORKFLOW (YOUR CURRENT PR):"
+            echo "================================================"
+            echo "  $SOURCE_BRANCH → main ❌"
+            echo ""
+            echo "Please close this PR and merge to a release branch first."
+            echo ""
+            exit 1
+          fi
