@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       artifact-name:
-        description: 'Name of the artifact to deploy'
+        description: 'Build artifact name from build job'
         required: true
         type: string
       aws-region:
@@ -20,13 +20,18 @@ on:
         required: true
         type: string
       platform:
-        description: 'Platform type'
+        description: 'Platform (java, node, python)'
         required: true
         type: string
       environment:
-        description: 'Deployment environment name (dev/uat/prod) for GitHub tracking'
+        description: 'Environment name for GitHub Deployments (dev, staging, prod)'
         required: true
         type: string
+      restrict-branches:
+        description: 'Comma-separated list of allowed branch patterns (e.g., "main,release/**"). Empty = no restriction.'
+        required: false
+        type: string
+        default: ''
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -34,13 +39,69 @@ on:
         required: true
 
 jobs:
+  verify-branch:
+    name: Verify Branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch restriction
+        run: |
+          ALLOWED_BRANCHES="${{ inputs.restrict-branches }}"
+          
+          # If no restriction, skip check
+          if [ -z "$ALLOWED_BRANCHES" ]; then
+            echo "✅ No branch restriction configured - allowing deployment"
+            exit 0
+          fi
+          
+          CURRENT_BRANCH="${{ github.ref_name }}"
+          echo "Current branch: $CURRENT_BRANCH"
+          echo "Allowed patterns: $ALLOWED_BRANCHES"
+          
+          # Convert comma-separated list to array
+          IFS=',' read -ra PATTERNS <<< "$ALLOWED_BRANCHES"
+          
+          # Check if current branch matches any pattern
+          ALLOWED=false
+          for PATTERN in "${PATTERNS[@]}"; do
+            # Trim whitespace
+            PATTERN=$(echo "$PATTERN" | xargs)
+            
+            # Convert glob pattern to regex
+            if [[ "$PATTERN" == *"**" ]]; then
+              # release/** → release/
+              REGEX_PATTERN="${PATTERN//\*\*/.*}"
+              if [[ "$CURRENT_BRANCH" =~ ^${REGEX_PATTERN} ]]; then
+                ALLOWED=true
+                echo "✅ Branch matches pattern: $PATTERN"
+                break
+              fi
+            else
+              # Exact match
+              if [ "$CURRENT_BRANCH" = "$PATTERN" ]; then
+                ALLOWED=true
+                echo "✅ Branch matches: $PATTERN"
+                break
+              fi
+            fi
+          done
+          
+          if [ "$ALLOWED" = false ]; then
+            echo "❌ Branch '$CURRENT_BRANCH' is not allowed for this deployment"
+            echo "   Allowed patterns: $ALLOWED_BRANCHES"
+            echo "   Environment: ${{ inputs.environment }}"
+            exit 1
+          fi
+
   deploy:
     name: Deploy to ${{ inputs.eb-environment-name }}
+    needs: verify-branch
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: http://${{ steps.get-url.outputs.environment-url }}
     permissions:
       contents: read
       deployments: write
-      pull-requests: write
 
     steps:
       # Create GitHub Deployment
@@ -69,9 +130,8 @@ jobs:
             console.log('✅ Deployment created:', deployment.data.id);
             return deployment.data.id;
       
-      # Set deployment status to in_progress
       - name: Set deployment status to in_progress
-        if: always() && steps.create-deployment.outputs.result != ''
+        if: steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
         env:
           DEPLOYMENT_ID: ${{ steps.create-deployment.outputs.result }}
@@ -82,8 +142,7 @@ jobs:
               repo: context.repo.repo,
               deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'in_progress',
-              description: 'Deployment started',
-              environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com'
+              description: '${{ inputs.environment }} deployment started'
             });
       
       - name: Checkout code
@@ -95,59 +154,13 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ./artifact
       
-      - name: Create deployment package (Java)
-        if: inputs.platform == 'java'
-        run: |
-          cd artifact
-          JAR_FILE=$(find . -name "*.jar" -type f | head -n 1)
-          if [ -z "$JAR_FILE" ]; then
-            echo "❌ No JAR file found"
-            exit 1
-          fi
-          zip -r ../deployment.zip .
-          cd ..
-      
-      - name: Create deployment package (Python)
-        if: inputs.platform == 'python'
+      - name: Create deployment package
         run: |
           cd artifact
           zip -r ../deployment.zip .
           cd ..
-      
-      - name: Create deployment package (Node.js)
-        if: inputs.platform == 'nodejs'
-        run: |
-          cd artifact
-          if [ -f package.json ]; then
-            npm ci --production
-          fi
-          zip -r ../deployment.zip .
-          cd ..
-      
-      - name: Create deployment package (Docker)
-        if: inputs.platform == 'docker'
-        run: |
-          cd artifact
-          if [ ! -f Dockerfile ]; then
-            echo "❌ No Dockerfile found"
-            exit 1
-          fi
-          zip -r ../deployment.zip .
-          cd ..
-      
-      - name: Use Dockerrun.aws.json (Docker ECR)
-        if: inputs.platform == 'docker-ecr'
-        run: |
-          cd artifact
-          if [ ! -f Dockerrun.aws.json ]; then
-            echo "❌ No Dockerrun.aws.json found"
-            exit 1
-          fi
-          zip -r ../deployment.zip Dockerrun.aws.json
-          cd ..
-          
-          echo "📦 Dockerrun.aws.json contents:"
-          unzip -p deployment.zip Dockerrun.aws.json
+          echo "✅ Deployment package created"
+          ls -lh deployment.zip
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -163,16 +176,11 @@ jobs:
           echo "version-label=$VERSION_LABEL" >> $GITHUB_OUTPUT
           
           BUCKET_NAME="elasticbeanstalk-${{ inputs.aws-region }}-$(aws sts get-caller-identity --query Account --output text)"
-          
-          if ! aws s3 ls "s3://${BUCKET_NAME}" 2>&1 | grep -q 'NoSuchBucket'; then
-            echo "✅ S3 bucket exists: ${BUCKET_NAME}"
-          else
-            aws s3 mb "s3://${BUCKET_NAME}" --region ${{ inputs.aws-region }}
-          fi
-          
           S3_KEY="${{ inputs.eb-application-name }}/${VERSION_LABEL}.zip"
+          
           aws s3 cp deployment.zip "s3://${BUCKET_NAME}/${S3_KEY}"
           
+          echo "✅ Uploaded to s3://${BUCKET_NAME}/${S3_KEY}"
           echo "s3-bucket=$BUCKET_NAME" >> $GITHUB_OUTPUT
           echo "s3-key=$S3_KEY" >> $GITHUB_OUTPUT
       
@@ -186,21 +194,28 @@ jobs:
             --application-name "${{ inputs.eb-application-name }}" \
             --version-label "$VERSION_LABEL" \
             --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
-            --description "Deployed by ${{ github.actor }} - Commit: ${{ github.sha }}" \
+            --description "Deployment by ${{ github.actor }} - Commit: ${{ github.sha }}" \
             --region ${{ inputs.aws-region }}
+          
+          echo "✅ Application version created: $VERSION_LABEL"
       
-      - name: Deploy to Elastic Beanstalk
+      - name: Deploy to ${{ inputs.environment }}
         run: |
           VERSION_LABEL="${{ steps.upload-s3.outputs.version-label }}"
+          
+          echo "🚀 Deploying to ${{ inputs.environment }} environment"
+          echo "   Version: $VERSION_LABEL"
+          echo "   Environment: ${{ inputs.eb-environment-name }}"
           
           aws elasticbeanstalk update-environment \
             --application-name "${{ inputs.eb-application-name }}" \
             --environment-name "${{ inputs.eb-environment-name }}" \
             --version-label "$VERSION_LABEL" \
             --region ${{ inputs.aws-region }}
+          
+          echo "✅ Deployment initiated"
       
       - name: Wait for deployment
-        id: wait-deployment
         run: |
           echo "Waiting for environment to become ready..."
           
@@ -226,22 +241,18 @@ jobs:
             
             if [ "$STATUS" = "Ready" ]; then
               if [ "$HEALTH" = "Green" ]; then
-                echo "deployment-status=success" >> $GITHUB_OUTPUT
                 echo "✅ Deployment successful!"
                 break
               elif [ "$HEALTH" = "Yellow" ]; then
-                echo "deployment-status=success" >> $GITHUB_OUTPUT
                 echo "⚠️  Deployment complete but health is Yellow"
                 break
               else
-                echo "deployment-status=failure" >> $GITHUB_OUTPUT
                 echo "❌ Deployment complete but health is $HEALTH"
                 exit 1
               fi
             elif [ "$STATUS" = "Updating" ]; then
               echo "Still updating... (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
             else
-              echo "deployment-status=failure" >> $GITHUB_OUTPUT
               echo "❌ Unexpected status: $STATUS"
               exit 1
             fi
@@ -251,7 +262,6 @@ jobs:
           done
           
           if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "deployment-status=failure" >> $GITHUB_OUTPUT
             echo "❌ Deployment timed out"
             exit 1
           fi
@@ -266,9 +276,8 @@ jobs:
             --query 'Environments[0].CNAME' \
             --output text)
           
-          echo "environment-url=http://${ENV_URL}" >> $GITHUB_OUTPUT
+          echo "environment-url=${ENV_URL}" >> $GITHUB_OUTPUT
       
-      # Set deployment status to success
       - name: Set deployment status to success
         if: success() && steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
@@ -281,15 +290,10 @@ jobs:
               repo: context.repo.repo,
               deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'success',
-              description: 'Deployment completed successfully',
-              environment_url: '${{ steps.get-url.outputs.environment-url }}',
-              log_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+              description: '${{ inputs.environment }} deployment completed',
+              environment_url: 'http://${{ steps.get-url.outputs.environment-url }}'
             });
-            
-            console.log('✅ Deployment marked as successful');
-            console.log('Environment URL: ${{ steps.get-url.outputs.environment-url }}');
       
-      # Set deployment status to failure
       - name: Set deployment status to failure
         if: failure() && steps.create-deployment.outputs.result != ''
         uses: actions/github-script@v7
@@ -302,55 +306,5 @@ jobs:
               repo: context.repo.repo,
               deployment_id: Number(process.env.DEPLOYMENT_ID),
               state: 'failure',
-              description: 'Deployment failed',
-              environment_url: 'http://${{ inputs.eb-environment-name }}.${{ inputs.aws-region }}.elasticbeanstalk.com',
-              log_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-            });
-            
-            console.log('❌ Deployment marked as failed');
-      
-      # Create deployment summary
-      - name: Create deployment summary
-        if: always()
-        run: |
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
-          ## 🚀 Deployment Summary
-          
-          **Environment:** \`${{ inputs.environment }}\`  
-          **Application:** \`${{ inputs.eb-application-name }}\`  
-          **EB Environment:** \`${{ inputs.eb-environment-name }}\`  
-          **Platform:** \`${{ inputs.platform }}\`  
-          **Version:** \`${{ steps.upload-s3.outputs.version-label }}\`  
-          **Commit:** \`${{ github.sha }}\`  
-          **Deployed by:** @${{ github.actor }}  
-          **URL:** ${{ steps.get-url.outputs.environment-url }}  
-          **Status:** ${{ job.status }}
-          
-          ### Deployment Details
-          - **AWS Region:** ${{ inputs.aws-region }}
-          - **S3 Bucket:** ${{ steps.upload-s3.outputs.s3-bucket }}
-          - **S3 Key:** ${{ steps.upload-s3.outputs.s3-key }}
-          
-          [View Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          EOF
-      
-      - name: Post deployment comment (on PR)
-        if: github.event_name == 'pull_request' && success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const comment = `## ✅ Deployment Successful
-            
-            **Environment:** \`${{ inputs.environment }}\`
-            **URL:** ${{ steps.get-url.outputs.environment-url }}
-            **Version:** \`${{ steps.upload-s3.outputs.version-label }}\`
-            **Deployed by:** @${{ github.actor }}
-            
-            [View Deployment Details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
-            
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: comment
+              description: '${{ inputs.environment }} deployment failed'
             });
