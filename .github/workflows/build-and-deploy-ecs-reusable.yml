@@ -1,0 +1,100 @@
+name: Build & Deploy to ECS (reusable)
+
+# Reusable workflow: builds a Docker image, pushes it to ECR, and (optionally) rolls an ECS service.
+# Used by container services that deploy to ECS/Fargate (e.g. fmc-api, fmc-worker) instead of the
+# Elastic Beanstalk deploy-reusable.
+#
+#   - Set `ecs-service` to also register a new task definition (rendered from `taskdef-path`) and
+#     roll that service. Leave it empty to publish the image only (e.g. fleet workers whose per-login
+#     services are managed by a control plane).
+#
+# The calling job runs in a GitHub Environment (dev/prod) and passes `secrets: inherit`.
+# Environment-scoped values read here:
+#   secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   vars:    AWS_REGION, ECS_CLUSTER, EXECUTION_ROLE_ARN, TASK_ROLE_ARN
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      ecr-repository:
+        required: true
+        type: string
+      dockerfile:
+        type: string
+        default: 'Dockerfile'
+      build-context:
+        type: string
+        default: '.'
+      ecs-service:
+        type: string
+        default: ''
+      taskdef-path:
+        type: string
+        default: ''
+      container-name:
+        type: string
+        default: ''
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ inputs.ecs-service }}
+      TASKDEF_PATH: ${{ inputs.taskdef-path }}
+      CONTAINER_NAME: ${{ inputs.container-name }}
+      EXECUTION_ROLE_ARN: ${{ vars.EXECUTION_ROLE_ARN }}
+      TASK_ROLE_ARN: ${{ vars.TASK_ROLE_ARN }}
+      # Provisioner infra for services whose task def references it (e.g. fmc-api launching workers).
+      WORKER_TASK_DEFINITION: ${{ vars.WORKER_TASK_DEFINITION }}
+      WORKER_SUBNETS: ${{ vars.WORKER_SUBNETS }}
+      WORKER_SECURITY_GROUPS: ${{ vars.WORKER_SECURITY_GROUPS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::12}"
+          docker build -f "${{ inputs.dockerfile }}" -t "$IMAGE" \
+            -t "$REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT" "${{ inputs.build-context }}"
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Render task definition
+        if: ${{ inputs.ecs-service != '' }}
+        run: |
+          export IMAGE ENVIRONMENT AWS_REGION EXECUTION_ROLE_ARN TASK_ROLE_ARN ECS_CLUSTER \
+                 WORKER_TASK_DEFINITION WORKER_SUBNETS WORKER_SECURITY_GROUPS
+          envsubst < "$TASKDEF_PATH" > taskdef.rendered.json
+          cat taskdef.rendered.json
+
+      - name: Register task def & roll service
+        if: ${{ inputs.ecs-service != '' }}
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.rendered.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered $TASK_DEF_ARN"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF_ARN"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
