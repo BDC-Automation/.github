@@ -16,6 +16,16 @@ on:
         description: 'ECR repository name (required if docker-build-in-ci is true)'
         required: false
         type: string
+      docker-build-args:
+        description: 'Newline-separated KEY=VALUE build args passed to docker build (docker-ecr only). E.g. BACKEND_URL=https://api.example.com'
+        required: false
+        type: string
+        default: ''
+      container-port:
+        description: 'Container port the app listens on (used in the generated Dockerrun.aws.json for docker-ecr)'
+        required: false
+        type: string
+        default: '8080'
       java-version:
         description: 'Java version (if platform is java)'
         required: false
@@ -184,9 +194,19 @@ jobs:
           ECR_REPOSITORY: ${{ inputs.ecr-repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          # Assemble --build-arg flags from the newline-separated docker-build-args input.
+          BUILD_ARGS=()
+          while IFS= read -r line; do
+            line="$(echo "$line" | xargs)"   # trim whitespace
+            [ -z "$line" ] && continue
+            BUILD_ARGS+=(--build-arg "$line")
+          done <<'EOF_BUILD_ARGS'
+          ${{ inputs.docker-build-args }}
+          EOF_BUILD_ARGS
+
           # Build Docker image
-          echo "Building Docker image..."
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          echo "Building Docker image (build-args: ${BUILD_ARGS[*]})..."
+          docker build "${BUILD_ARGS[@]}" -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
           # Push to ECR
@@ -275,8 +295,8 @@ jobs:
             },
             "Ports": [
               {
-                "ContainerPort": 8080,
-                "HostPort": 8080
+                "ContainerPort": ${{ inputs.container-port }},
+                "HostPort": ${{ inputs.container-port }}
               }
             ]
           }
