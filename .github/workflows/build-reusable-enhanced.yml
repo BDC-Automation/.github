@@ -60,6 +60,11 @@ on:
         required: false
       AWS_REGION:
         required: false
+      # Optional: a read token for a private GitHub Packages (Maven) registry. When provided, it's
+      # injected into the Docker build as GH_USER/GH_TOKEN build-args so the Dockerfile's build stage
+      # can resolve private dependencies. Ignored when not set (backward-compatible).
+      GH_PACKAGES_TOKEN:
+        required: false
 
 jobs:
   build:
@@ -193,6 +198,8 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ inputs.ecr-repository }}
           IMAGE_TAG: ${{ github.sha }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          GH_PACKAGES_USER: ${{ github.actor }}
         run: |
           # Assemble --build-arg flags from the newline-separated docker-build-args input.
           BUILD_ARGS=()
@@ -204,8 +211,13 @@ jobs:
           ${{ inputs.docker-build-args }}
           EOF_BUILD_ARGS
 
-          # Build Docker image
+          # Optional private GitHub Packages auth — added AFTER the log line below so the token is
+          # never printed. The secret value is also masked by Actions regardless.
           echo "Building Docker image (build-args: ${BUILD_ARGS[*]})..."
+          if [ -n "${GH_PACKAGES_TOKEN:-}" ]; then
+            BUILD_ARGS+=(--build-arg "GH_USER=${GH_PACKAGES_USER}" --build-arg "GH_TOKEN=${GH_PACKAGES_TOKEN}")
+          fi
+
           docker build "${BUILD_ARGS[@]}" -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
