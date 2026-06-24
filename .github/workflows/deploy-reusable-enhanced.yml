@@ -156,6 +156,12 @@ jobs:
       
       - name: Create deployment package
         run: |
+          # The build artifact carries the jar; actions/checkout above provides the EB platform/proxy
+          # config (.platform / .ebextensions). Bundle them together so customisations like nginx's
+          # client_max_body_size actually reach EB — zipping artifact/ alone silently drops them.
+          for d in .platform .ebextensions; do
+            if [ -d "$d" ]; then cp -r "$d" artifact/ && echo "bundled $d"; fi
+          done
           cd artifact
           zip -r ../deployment.zip .
           cd ..
