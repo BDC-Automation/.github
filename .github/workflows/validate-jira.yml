@@ -18,6 +18,10 @@ on:
 jobs:
   validate-branch:
     name: Validate Branch Name
+    # Release branches (release/dd-mm-yyyy) don't carry a JIRA id by design — they
+    # aggregate work from many feature branches that each already had their own
+    # JIRA validation at PR time. Skip all three JIRA checks for any release source.
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'release/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check branch name contains JIRA ID
@@ -46,6 +50,7 @@ jobs:
   
   validate-commits:
     name: Validate Commit Messages
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'release/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -101,6 +106,7 @@ jobs:
   validate-jira-issue:
     name: Validate JIRA Issue
     needs: validate-branch
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'release/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Get JIRA ID from branch
