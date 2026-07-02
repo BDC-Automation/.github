@@ -281,6 +281,9 @@ jobs:
             .
             !node_modules
             !.git
+          # Include dotfiles (.env, .npmrc, ...) — upload-artifact@v4 excludes hidden
+          # files by default, which would silently drop committed config from the bundle.
+          include-hidden-files: true
           retention-days: 7
       
       - name: Upload Docker artifact
@@ -293,6 +296,10 @@ jobs:
             !.git
             !.github
             !node_modules
+          # Include dotfiles (.env, .dockerignore, ...) — upload-artifact@v4 excludes
+          # hidden files by default, which drops them from the EB source bundle and
+          # breaks on-instance `docker build` (e.g. COPY .env -> "/.env": not found).
+          include-hidden-files: true
           retention-days: 7
       
       - name: Create Dockerrun.aws.json for ECR (Docker ECR)
